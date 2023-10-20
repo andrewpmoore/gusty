@@ -552,7 +552,11 @@ video {
 }
 
 .to-purple-400 {
-    --tw-gradient-to: #345ad7;
+    --tw-gradient-to: #9e34d7;
+}
+
+.to-purple-500 {
+    --tw-gradient-to: #4c70e5;
 }
 
 .bg-clip-text {
