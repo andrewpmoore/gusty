@@ -1,0 +1,31 @@
+name: Daily City Script
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # Schedule to run every day at 1 am
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.8  # Change this to your Python version if needed
+
+    - name: Install Dependencies
+      run: |
+        pip install -r requirements.txt  # If you have any dependencies
+
+    - name: Run City Script
+      run: python scripts/city.py scripts/locations.txt
+
+    - name: Upload JSON Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: world_weather
+        path: scripts/world_weather.json
