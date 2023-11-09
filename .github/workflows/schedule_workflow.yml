@@ -23,10 +23,10 @@ jobs:
         pip install -r requirements.txt  # If you have any dependencies
 
     - name: Run City Script
-      run: python scripts/city.py scripts/locations.txt
+      run: python city.py locations.txt
 
     - name: Upload JSON Artifact
       uses: actions/upload-artifact@v2
       with:
         name: world_weather
-        path: scripts/world_weather.json
+        path: world_weather.json
