@@ -72,7 +72,7 @@ def main():
                 print(f"Skipping row {i} due to previous error.")
 
     # Write the combined output to a single JSON file without spaces
-    with open('combined_output.json', 'w') as output_file:
+    with open('world_weather.json', 'w') as output_file:
         json.dump(output, output_file, separators=(',', ':'))
 
 if __name__ == "__main__":
