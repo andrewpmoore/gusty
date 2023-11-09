@@ -3,6 +3,7 @@ name: Daily City Script
 on:
   schedule:
     - cron: '0 1 * * *'  # Schedule to run every day at 1 am
+  workflow_dispatch:
 
 jobs:
   run-script:
