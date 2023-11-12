@@ -13,16 +13,12 @@ def get_weather_data(city_id):
         return None
 
 
-
 def parse_and_append_output(data, city_name, output):
     if data is not None:  # Only process if data is available
         city_info = {
             "name": city_name,
             "lat": data["city"]["cityLatitude"],
-            "lng": data["city"]["cityLongitude"], 
-            "isCapital": data["city"]["isCapital"],
-            "src": data["city"]["member"]["url"],
-            "srcName": data["city"]["member"]["orgName"],
+            "lng": data["city"]["cityLongitude"],
             "forecastDate": [],
             "maxTemp": [],
             "minTemp": [],
@@ -40,27 +36,27 @@ def parse_and_append_output(data, city_name, output):
             city_info["minTemp"].append(min_temp)
             city_info["weatherIcon"].append(weather_icon)
 
-        output[city_name] = city_info
+        output.append(city_info)
 
 
 
 def main():
-    output = {}  # Initialize the output dictionary
-    
+    output = []  # Initialize the output list
+
     with open('locations.txt', 'r') as file:
         reader = csv.reader(file, delimiter=';')
         next(reader)  # skip header row
-        
+
         row_count = sum(1 for row in reader)  # Count the number of rows
-        
+
         # Reset file pointer to the beginning
         file.seek(0)
         next(reader)  # Skip header row again
-        
+
         for i, row in enumerate(reader, 1):
             country, city, city_id = row
             data = get_weather_data(city_id)
-            
+
             if data is not None:
                 parse_and_append_output(data, city, output)
                 print(f"Processed row {i} of {row_count}")
@@ -73,3 +69,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+Now, the output will be a list of city information directly without an additional level.
+
+
+
+
+
+
