@@ -22,30 +22,22 @@ jobs:
         run: |
           pip install -r requirements.txt  # If you have any dependencies
 
+      - name: Run City Script
+        run: python city.py locations.txt
+
+      - name: Move JSON File to data Directory
+        run: |
+          mkdir -p data
+          mv world_weather.json data/world_weather.json
+
       - name: Configure Git
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
-          git remote add origin_with_token "https://${{ secrets.GH_TOKEN }}@github.com/${{ github.repository }}"
-          git fetch origin_with_token gh-pages
 
-      - name: Run City Script
-        run: python city.py locations.txt
-
-      - name: Move JSON File to Docs Directory
+      - name: Commit and Push to Main
         run: |
-          mkdir -p docs
-          mv world_weather.json docs/world_weather.json
-
-      - name: Commit and Push to GitHub Pages
-        run: |
-          git checkout -b gh-pages
-          git add docs/world_weather.json
+          git add data/world_weather.json
           git commit -m "Deploy world_weather.json to GitHub Pages"
-          git pull origin_with_token main
-          git push --force origin_with_token gh-pages
-
-      - name: Clean Up
-        run: |
-          git checkout main  # Change 'main' to your branch name
-          git branch -D gh-pages
+          git pull origin main
+          git push origin main
