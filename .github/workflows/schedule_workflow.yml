@@ -38,6 +38,7 @@ jobs:
     - name: Commit and Push to GitHub Pages
       run: |
         git checkout -b gh-pages
+        git pull
         git add docs/world_weather.json
         git commit -m "Deploy world_weather.json to GitHub Pages"
         git push origin gh-pages
