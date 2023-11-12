@@ -19,7 +19,7 @@ def parse_and_append_output(data, city_name, output):
         city_info = {
             "name": city_name,
             "lat": data["city"]["cityLatitude"],
-            "lng": data["city"]["cityLongitude"],
+            "lng": data["city"]["cityLongitude"], 
             "isCapital": data["city"]["isCapital"],
             "src": data["city"]["member"]["url"],
             "srcName": data["city"]["member"]["orgName"],
@@ -40,7 +40,8 @@ def parse_and_append_output(data, city_name, output):
             city_info["minTemp"].append(min_temp)
             city_info["weatherIcon"].append(weather_icon)
 
-        output[city_name] = {"city": [city_info]}
+        output[city_name] = city_info
+
 
 
 def main():
