@@ -44,5 +44,5 @@ jobs:
 
     - name: Clean Up
       run: |
-        git checkout master  # Change 'master' to your branch name
+        git checkout main  # Change 'main' to your branch name
         git branch -D gh-pages
