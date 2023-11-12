@@ -15,8 +15,8 @@ def get_weather_data(city_id):
 def parse_and_append_output(data, city_name, output):
     if data is not None:  # Only process if data is available
         for city_data in data["city"]["forecast"]["forecastDay"]:
-            city_lat = round(data["city"]["cityLatitude"], 4)
-            city_lng = round(data["city"]["cityLongitude"], 4)
+            city_lat = data["city"]["cityLatitude"]
+            city_lng = data["city"]["cityLongitude"]
             is_capital = data["city"]["isCapital"]
             src = data["city"]["member"]["url"]
             src_name = data["city"]["member"]["orgName"]
