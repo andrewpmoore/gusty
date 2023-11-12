@@ -15,8 +15,8 @@ def get_weather_data(city_id):
 def parse_and_append_output(data, city_name, output):
     if data is not None:  # Only process if data is available
         for city_data in data["city"]["forecast"]["forecastDay"]:
-            city_lat = data["city"]["cityLatitude"]
-            city_lng = data["city"]["cityLongitude"]
+            city_lat = round(data["city"]["cityLatitude"], 4)
+            city_lng = round(data["city"]["cityLongitude"], 4)
             is_capital = data["city"]["isCapital"]
             src = data["city"]["member"]["url"]
             src_name = data["city"]["member"]["orgName"]
@@ -33,20 +33,17 @@ def parse_and_append_output(data, city_name, output):
                 "isCapital": is_capital,
                 "src": src,
                 "srcName": src_name,
-                "forecastDay": [
-                    {
-                        "forecastDate": forecast_date,
-                        "maxTemp": max_temp,
-                        "minTemp": min_temp,
-                        "weatherIcon": weather_icon
-                    }
-                ]
+                "forecastDate": forecast_date,
+                "maxTemp": max_temp,
+                "minTemp": min_temp,
+                "weatherIcon": weather_icon
             }
 
             if city_name not in output:
                 output[city_name] = {"city": []}
 
             output[city_name]["city"].append(city_info)
+
 
 def main():
     output = {}  # Initialize the output dictionary

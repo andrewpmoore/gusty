@@ -10,8 +10,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository with Limited History
         uses: actions/checkout@v2
+        with:
+          ref: main
+          fetch-depth: 3  # Set the number of commits to fetch
 
       - name: Set up Python
         uses: actions/setup-python@v2
