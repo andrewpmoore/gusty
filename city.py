@@ -69,7 +69,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-Now, the output will be a list of city information directly without an additional level.
 
 
 
