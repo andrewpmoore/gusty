@@ -12,38 +12,35 @@ def get_weather_data(city_id):
         print(f"Error fetching data for city_id {city_id}: {e}")
         return None
 
+
 def parse_and_append_output(data, city_name, output):
     if data is not None:  # Only process if data is available
-        for city_data in data["city"]["forecast"]["forecastDay"]:
-            city_lat = data["city"]["cityLatitude"]
-            city_lng = data["city"]["cityLongitude"]
-            is_capital = data["city"]["isCapital"]
-            src = data["city"]["member"]["url"]
-            src_name = data["city"]["member"]["orgName"]
+        city_info = {
+            "name": city_name,
+            "lat": round(data["city"]["cityLatitude"]),
+            "lng": round(data["city"]["cityLongitude"]),
+            "isCapital": data["city"]["isCapital"],
+            "src": data["city"]["member"]["url"],
+            "srcName": data["city"]["member"]["orgName"],
+            "forecast": []
+        }
 
+        for city_data in data["city"]["forecast"]["forecastDay"]:
             forecast_date = city_data["forecastDate"]
             max_temp = city_data["maxTemp"]
             min_temp = city_data["minTemp"]
             weather_icon = city_data["weatherIcon"]
 
-            city_info = {
-                "name": city_name,
-                "lat": city_lat,
-                "lng": city_lng,
-                "isCapital": is_capital,
-                "src": src,
-                "srcName": src_name,
+            day_info = {
                 "forecastDate": forecast_date,
                 "maxTemp": max_temp,
                 "minTemp": min_temp,
                 "weatherIcon": weather_icon
             }
 
-            if city_name not in output:
-                output[city_name] = {"city": []}
+            city_info["forecast"].append(day_info)
 
-            output[city_name]["city"].append(city_info)
-
+        output[city_name] = {"city": [city_info]}
 
 def main():
     output = {}  # Initialize the output dictionary
