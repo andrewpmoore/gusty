@@ -2,7 +2,7 @@ name: Daily City Script and Deploy to GitHub Pages
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # Schedule to run every day at 1 am
+    - cron: '0 1,13 * * *'  # Schedule to run every day at 1 am and 1pm
   workflow_dispatch:
 
 jobs:
