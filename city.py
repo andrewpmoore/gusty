@@ -41,7 +41,7 @@ def parse_and_append_output(data, city_name, output):
 
 
 def main():
-    output = []  # Initialize the output list
+    output = {"cities": []}  # Initialize the output dictionary with "cities" key
 
     with open('locations.txt', 'r') as file:
         reader = csv.reader(file, delimiter=';')
@@ -58,7 +58,7 @@ def main():
             data = get_weather_data(city_id)
 
             if data is not None:
-                parse_and_append_output(data, city, output)
+                parse_and_append_output(data, city, output["cities"])
                 print(f"Processed row {i} of {row_count}")
             else:
                 print(f"Skipping row {i} due to previous error.")
