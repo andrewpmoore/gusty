@@ -19,7 +19,7 @@ def parse_and_append_output(data, city_name, output):
             "name": city_name,
             "lat": data["city"]["cityLatitude"],
             "lng": data["city"]["cityLongitude"],
-            "src": data["city"]["member"]["orgName"]
+            "src": data["city"]["member"]["orgName"],
             "forecastDate": [],
             "maxTemp": [],
             "minTemp": [],
