@@ -1,4 +1,4 @@
-name: Daily City Script
+name: Daily City Script and Deploy to GitHub Pages
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-script:
+  run-script-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,10 +23,26 @@ jobs:
         pip install -r requirements.txt  # If you have any dependencies
 
     - name: Run City Script
-      run: python city.py locations.txt
+      run: python scripts/city.py scripts/locations.txt
 
-    - name: Upload JSON Artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: world_weather
-        path: world_weather.json
+    - name: Move JSON File to Docs Directory
+      run: |
+        mkdir -p docs
+        mv world_weather.json docs/world_weather.json
+
+    - name: Configure Git
+      run: |
+        git config --local user.email "actions@github.com"
+        git config --local user.name "GitHub Actions"
+
+    - name: Commit and Push to GitHub Pages
+      run: |
+        git checkout -b gh-pages
+        git add docs/world_weather.json
+        git commit -m "Deploy world_weather.json to GitHub Pages"
+        git push origin gh-pages
+
+    - name: Clean Up
+      run: |
+        git checkout master  # Change 'master' to your branch name
+        git branch -D gh-pages
