@@ -17,8 +17,8 @@ def parse_and_append_output(data, city_name, output):
     if data is not None:  # Only process if data is available
         city_info = {
             "name": city_name,
-            "lat": round(data["city"]["cityLatitude"]),
-            "lng": round(data["city"]["cityLongitude"]),
+            "lat": data["city"]["cityLatitude"],
+            "lng": data["city"]["cityLongitude"],
             "isCapital": data["city"]["isCapital"],
             "src": data["city"]["member"]["url"],
             "srcName": data["city"]["member"]["orgName"],
