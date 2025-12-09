@@ -32,7 +32,7 @@ jobs:
 
       - name: Run Fetch & Convert Script
         run: |
-          python scripts/fetch_wind_data.py
+          python fetch_wind_data.py
 
       - name: Commit and Push Data
         uses: stefanzweifel/git-auto-commit-action@v5
