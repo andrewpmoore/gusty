@@ -7,8 +7,9 @@ import numpy as np
 import xarray as xr
 
 # --- CONFIGURATION ---
-# UPDATED: Changed from 1p00 to 0p50 (0.5 degree resolution)
-BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p50.pl"
+# We use the 0.25 degree filter because it is STABLE.
+# We will downsample it to 0.50 locally.
+BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 OUTPUT_DIR = "public/data"
 HOURS_TO_FETCH = range(0, 25, 3) 
 
@@ -32,13 +33,23 @@ def get_latest_run_time():
 
 def convert_to_json(grib_path, json_path):
     try:
+        # Open the high-res 0.25 degree file
         ds = xr.open_dataset(grib_path, engine='cfgrib')
-        u_var = ds['u10']
-        v_var = ds['v10']
+        
+        # --- DOWNSAMPLING MAGIC ---
+        # Slicing [::2] takes every 2nd data point.
+        # This converts 0.25 deg -> 0.50 deg resolution.
+        # It reduces the data array size by 75% while keeping the details.
+        
+        # Slice the variables
+        u_var = ds['u10'][::2, ::2]
+        v_var = ds['v10'][::2, ::2]
+        
+        # Slice the coordinates to match
+        lat = ds.latitude.values[::2]
+        lon = ds.longitude.values[::2]
 
-        lat = ds.latitude.values
-        lon = ds.longitude.values
-        # Dynamically calculate grid spacing so the app adapts automatically
+        # Recalculate grid spacing based on the new subsampled grid
         dy = (lat[-1] - lat[0]) / (len(lat) - 1)
         dx = (lon[-1] - lon[0]) / (len(lon) - 1)
         
@@ -46,6 +57,7 @@ def convert_to_json(grib_path, json_path):
         output_data = []
 
         for name, var, param_num in [("UGRD", u_var, 2), ("VGRD", v_var, 3)]:
+            # Flatten the SUBSAMPLED data
             flat_data = np.where(np.isnan(var.values), 0, var.values).flatten()
             flat_data = [round(float(x), 1) for x in flat_data]
 
@@ -83,8 +95,8 @@ def download_and_process(date, run_hour, forecast_hour):
     json_path = os.path.join(OUTPUT_DIR, json_filename)
 
     params = {
-        # UPDATED: Changed file parameter to 0p50
-        'file': f"gfs.t{run_hour}z.pgrb2.0p50.f{f_str}",
+        # Request the RELIABLE 0.25 degree file
+        'file': f"gfs.t{run_hour}z.pgrb2.0p25.f{f_str}",
         'lev_10_m_above_ground': 'on',
         'var_UGRD': 'on',
         'var_VGRD': 'on',
@@ -96,14 +108,17 @@ def download_and_process(date, run_hour, forecast_hour):
     }
 
     try:
-        print(f"⬇️ Downloading f{f_str} (0.50 deg)...")
-        response = requests.get(BASE_URL, params=params, stream=True, timeout=120) # Increased timeout for larger files
+        print(f"⬇️ Downloading f{f_str} (Source: 0.25 -> Target: 0.50)...")
+        # Increased timeout as 0.25 files are ~4MB
+        response = requests.get(BASE_URL, params=params, stream=True, timeout=180) 
         if response.status_code == 200:
             with open(grib_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             
             success, ref_time = convert_to_json(grib_path, json_path)
+            
+            # Clean up heavy GRIB file immediately
             if os.path.exists(grib_path):
                 os.remove(grib_path)
             
@@ -122,7 +137,7 @@ def download_and_process(date, run_hour, forecast_hour):
 
 def main():
     date, run = get_latest_run_time()
-    print(f"--- Processing GFS Run: {date} {run}z (0.50 Resolution) ---")
+    print(f"--- Processing GFS Run: {date} {run}z ---")
     
     generated_files = []
     model_ref_time = None
@@ -132,7 +147,6 @@ def main():
         if result:
             generated_files.append(result)
             model_ref_time = result['ref_time']
-        # Added small sleep to prevent NOAA throttling
         time.sleep(1)
 
     if generated_files:
