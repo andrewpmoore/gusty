@@ -6,10 +6,11 @@ import json
 import numpy as np
 import xarray as xr
 
-# --- Configuration ---
-BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl"
+# --- CONFIGURATION ---
+# UPDATED: Changed from 1p00 to 0p50 (0.5 degree resolution)
+BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p50.pl"
 OUTPUT_DIR = "public/data"
-HOURS_TO_FETCH = range(0, 25, 3) # 0, 3, 6... 24
+HOURS_TO_FETCH = range(0, 25, 3) 
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -30,10 +31,6 @@ def get_latest_run_time():
     return date_str, f"{run_hour:02d}"
 
 def convert_to_json(grib_path, json_path):
-    """
-    Converts GRIB to JSON.
-    Returns the valid RefTime (timestamp of the model run) to save in the manifest.
-    """
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
         u_var = ds['u10']
@@ -41,16 +38,14 @@ def convert_to_json(grib_path, json_path):
 
         lat = ds.latitude.values
         lon = ds.longitude.values
+        # Dynamically calculate grid spacing so the app adapts automatically
         dy = (lat[-1] - lat[0]) / (len(lat) - 1)
         dx = (lon[-1] - lon[0]) / (len(lon) - 1)
         
-        # Capture the model run time as an ISO string for the app to parse
         ref_time_iso = str(ds.time.values)
-
         output_data = []
 
         for name, var, param_num in [("UGRD", u_var, 2), ("VGRD", v_var, 3)]:
-            # Flatten and round to 1 decimal place for mobile bandwidth efficiency
             flat_data = np.where(np.isnan(var.values), 0, var.values).flatten()
             flat_data = [round(float(x), 1) for x in flat_data]
 
@@ -88,7 +83,8 @@ def download_and_process(date, run_hour, forecast_hour):
     json_path = os.path.join(OUTPUT_DIR, json_filename)
 
     params = {
-        'file': f"gfs.t{run_hour}z.pgrb2.1p00.f{f_str}",
+        # UPDATED: Changed file parameter to 0p50
+        'file': f"gfs.t{run_hour}z.pgrb2.0p50.f{f_str}",
         'lev_10_m_above_ground': 'on',
         'var_UGRD': 'on',
         'var_VGRD': 'on',
@@ -100,15 +96,16 @@ def download_and_process(date, run_hour, forecast_hour):
     }
 
     try:
-        print(f"⬇️ Downloading f{f_str}...")
-        response = requests.get(BASE_URL, params=params, stream=True, timeout=60)
+        print(f"⬇️ Downloading f{f_str} (0.50 deg)...")
+        response = requests.get(BASE_URL, params=params, stream=True, timeout=120) # Increased timeout for larger files
         if response.status_code == 200:
             with open(grib_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             
             success, ref_time = convert_to_json(grib_path, json_path)
-            os.remove(grib_path)
+            if os.path.exists(grib_path):
+                os.remove(grib_path)
             
             if success:
                 return {
@@ -116,6 +113,8 @@ def download_and_process(date, run_hour, forecast_hour):
                     "file": json_filename,
                     "ref_time": ref_time
                 }
+        else:
+            print(f"⚠️ NOAA Error {response.status_code} for f{f_str}")
     except Exception as e:
         print(f"❌ Download failed: {e}")
     
@@ -123,7 +122,7 @@ def download_and_process(date, run_hour, forecast_hour):
 
 def main():
     date, run = get_latest_run_time()
-    print(f"--- Processing GFS Run: {date} {run}z ---")
+    print(f"--- Processing GFS Run: {date} {run}z (0.50 Resolution) ---")
     
     generated_files = []
     model_ref_time = None
@@ -133,12 +132,12 @@ def main():
         if result:
             generated_files.append(result)
             model_ref_time = result['ref_time']
+        # Added small sleep to prevent NOAA throttling
+        time.sleep(1)
 
-    # --- Generate Manifest for Mobile App ---
-    # The app fetches this FIRST to see if it needs to update local cache
     if generated_files:
         manifest = {
-            "model_run_iso": model_ref_time,  # e.g., "2023-10-25T12:00:00.000000000"
+            "model_run_iso": model_ref_time,
             "generated_at": datetime.datetime.now().isoformat(),
             "files": generated_files
         }
@@ -148,7 +147,7 @@ def main():
             json.dump(manifest, f, indent=2)
         print("✅ Manifest generated.")
     else:
-        print("❌ No files generated, skipping manifest.")
+        print("❌ No files generated.")
         exit(1)
 
 if __name__ == "__main__":
