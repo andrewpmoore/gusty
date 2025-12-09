@@ -11,7 +11,7 @@ BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 OUTPUT_DIR = "public/data"
 # For this demo, we only fetch 'now' (0h) to save GitHub Action time. 
 # You can add [3, 6, 9...] later.
-HOURS_TO_FETCH = [0] 
+HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
 TILE_SIZE = 20  # Size of each tile in degrees (20x20 deg)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
