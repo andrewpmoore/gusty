@@ -1,4 +1,5 @@
 import os
+import shutil
 import requests
 import datetime
 import time
@@ -39,15 +40,15 @@ NOAA_CONFIG = {
         "name_map": {"prmsl": "data"}
     },
     "waves": {
-        "type": "gfs_wave",  # <--- SPECIAL HANDLER
-        "vars": {"var_HTSGW": "on", "var_WVDIR": "on"}, # Height & Direction
+        "type": "gfs_wave", 
+        "vars": {"var_HTSGW": "on", "var_WVDIR": "on"}, # Sig Height & Direction
         "level": {"lev_surface": "on"},
         "json_type": "vector",
         "name_map": {"swh": "u", "mwdir": "v"} 
     },
     "smoke": {
-        "type": "gefs_aero", # <--- SPECIAL HANDLER
-        "vars": {"var_PMTF": "on"}, # PM2.5 Fine Particulate Matter
+        "type": "gefs_aero", 
+        "vars": {"var_PMTF": "on"}, # PM2.5
         "level": {"lev_surface": "on"},
         "json_type": "scalar",
         "name_map": {"pmtf": "data"}
@@ -76,16 +77,21 @@ NOAA_CONFIG = {
 }
 
 OUTPUT_DIR = "public/data"
-# Matches your request: 3h intervals up to 24h, then 12h intervals
+# Fetch 0 to 72 hours
 HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
 TILE_SIZE = 20
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def clean_output_directory():
+    """Wipes the output directory to ensure no stale data remains."""
+    if os.path.exists(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def get_latest_run_time():
     """Calculates the latest available run based on UTC time."""
     now = datetime.datetime.now(datetime.timezone.utc)
     possible_runs = [0, 6, 12, 18]
+    # Backdate 4h 30m to ensure upload completion
     check_time = now - datetime.timedelta(hours=4, minutes=30) 
     
     date_str = check_time.strftime("%Y%m%d")
@@ -100,9 +106,10 @@ def get_latest_run_time():
 
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
+        # Engine cfgrib requires libeccodes
         ds = xr.open_dataset(grib_path, engine='cfgrib')
         
-        # Normalize longitude to -180 to 180
+        # Normalize longitude -180 to 180
         ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
         ref_time_iso = str(ds.time.values)
         print(f"   ✂️ Tiling {job_type}...")
@@ -145,10 +152,8 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                     data_vars = list(subset.data_vars)
                     if not data_vars: continue
                     var1 = subset[data_vars[0]]
-                    
                     precision = 1
                     if job_type in ['snow', 'smoke', 'dust']: precision = 3
-                    
                     flat1 = [round(float(x), precision) for x in np.where(np.isnan(var1.values), 0, var1.values).flatten()]
                     output_data.append(make_record(lon_vals, lat_vals, dx, dy, 0, flat1, ref_time_iso))
 
@@ -180,34 +185,25 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
     conf = NOAA_CONFIG[job_type]
     f_str = f"{forecast_hour:03d}"
     
-    # --- DYNAMIC URL GENERATOR ---
-    # 1. GFS ATMOS (Wind, Temp, Rain)
+    # --- URL GENERATION ---
     if conf['type'] == 'gfs_atmos':
         base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
         server_file = f"gfs.t{run_hour}z.pgrb2.0p25.f{f_str}"
         dir_path = f"/gfs.{date}/{run_hour}/atmos"
-
-    # 2. GFS WAVE (Waves) - Different Directory!
     elif conf['type'] == 'gfs_wave':
         base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
-        # Wave model has a different filename pattern 'gfswave'
         server_file = f"gfswave.t{run_hour}z.global.0p25.f{f_str}.grib2"
         dir_path = f"/gfs.{date}/{run_hour}/wave/gridded"
-
-    # 3. GEFS AEROSOL (Smoke, Dust) - Different Server Script!
     elif conf['type'] == 'gefs_aero':
         base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gefs_aer_0p25s.pl"
-        # Uses 'gec00' (Control Member) and 'pgrb2s' (Subset of variables)
         server_file = f"gec00.t{run_hour}z.pgrb2s.0p25.f{f_str}"
         dir_path = f"/gefs.{date}/{run_hour}/chem/pgrb2sp25"
 
     grib_path = os.path.join(OUTPUT_DIR, f"temp_{job_type}_{forecast_hour}.grib2")
 
     params = {
-        'file': server_file,
-        'dir': dir_path,
-        'leftlon': '0', 'rightlon': '360',
-        'toplat': '90', 'bottomlat': '-90',
+        'file': server_file, 'dir': dir_path,
+        'leftlon': '0', 'rightlon': '360', 'toplat': '90', 'bottomlat': '-90',
         **conf['vars'], **conf['level']
     }
 
@@ -234,13 +230,31 @@ if __name__ == "__main__":
     parser.add_argument("--type", help="Data type to fetch", default="all")
     args = parser.parse_args()
 
+    # 1. CLEANUP FIRST!
+    print("--- Cleaning Output Directory ---")
+    clean_output_directory()
+
     date, run = get_latest_run_time()
     print(f"--- Starting Fetch: {date} {run}z ---")
 
     jobs = list(NOAA_CONFIG.keys()) if args.type == "all" else [args.type]
+    manifest_updates = {}
     
     for job in jobs:
         print(f"\n--- Processing: {job} ---")
+        job_ref_time = None
+        total_tiles = 0
+        
         for hour in HOURS_TO_FETCH:
-            download_and_process(job, date, run, hour)
+            ref_time, count = download_and_process(job, date, run, hour)
+            if ref_time: job_ref_time = ref_time
+            total_tiles += count
             time.sleep(1) # Be nice to NOAA
+        
+        if job_ref_time:
+            manifest_updates[job] = {"ref_time": job_ref_time, "tiles": total_tiles}
+
+    if manifest_updates:
+        print("\n✅ Batch Complete.")
+        with open(os.path.join(OUTPUT_DIR, "manifest_update.json"), 'w') as f:
+            json.dump(manifest_updates, f, indent=2)
