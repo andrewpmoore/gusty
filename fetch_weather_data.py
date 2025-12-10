@@ -17,6 +17,12 @@ NOAA_CONFIG = {
         "level": {"lev_10_m_above_ground": "on"},
         "json_type": "vector"
     },
+    "gusts": {
+        "type": "gfs_atmos",
+        "vars": {"var_GUST": "on"},
+        "level": {"lev_surface": "on"},
+        "json_type": "scalar" # Gust is a single speed value (m/s), not a vector
+    },
     "temp": {
         "type": "gfs_atmos",
         "vars": {"var_TMP": "on"},
