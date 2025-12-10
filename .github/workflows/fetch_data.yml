@@ -36,13 +36,13 @@ jobs:
           # This script cleans public/data locally and then fills it with new JSONs
           python fetch_weather_data.py --type all
 
-      - name: Deploy Data to Orphan Branch
+      - name: Deploy Data to Separate Repo
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          folder: public/data      # We only deploy the data folder
-          branch: weather-data     # The target branch (separate from main)
-          
-          # --- HISTORY MANAGEMENT ---
-          single-commit: true      # Wipes history of this branch every run!
-          force: true              # Forces the overwrite
-          clean: true              # Removes old files not in current build
+          token: ${{ secrets.DATA_REPO_TOKEN }}  # Use the PAT we just made
+          repository-name: andrewpmoore/gusty-data # <--- TARGET REPO
+          folder: public/data
+          branch: main             # Push to main branch of the data repo
+          single-commit: true      # Delete history every time
+          force: true
+          clean: true
