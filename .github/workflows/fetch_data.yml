@@ -36,7 +36,7 @@ jobs:
         run: |
           # Fetching 'all' might take 10-15 minutes. 
           # GitHub Actions timeout is usually 6 hours, so this is fine.
-          python scripts/fetch_weather_data.py --type all
+          python fetch_weather_data.py --type all
 
       - name: Deploy to Branch
         uses: stefanzweifel/git-auto-commit-action@v5
