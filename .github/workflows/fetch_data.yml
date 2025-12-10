@@ -1,23 +1,23 @@
-name: Fetch All Weather Data
+name: Fetch Weather Data
 
 on:
   schedule:
-    # Run at 04:30, 10:30, 16:30, 22:30 UTC (to catch the 00, 06, 12, 18 runs)
+    # Run every 6 hours (04:30, 10:30, etc. UTC)
     - cron: '30 4,10,16,22 * * *'
-  workflow_dispatch: # Manual trigger button
+  workflow_dispatch: # Allows manual run button
 
 permissions:
   contents: write
 
 jobs:
-  fetch-and-tile:
+  update-weather:
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install System Dependencies (eccodes)
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libeccodes0 libeccodes-dev
@@ -31,16 +31,18 @@ jobs:
         run: |
           pip install requests xarray cfgrib numpy argparse
 
-      # You can split this into multiple steps if you want to fail gracefully
-      - name: Fetch Data Layers
+      - name: Run Fetch Script
         run: |
-          # Fetching 'all' might take 10-15 minutes. 
-          # GitHub Actions timeout is usually 6 hours, so this is fine.
+          # This script cleans public/data locally and then fills it with new JSONs
           python fetch_weather_data.py --type all
 
-      - name: Deploy to Branch
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Deploy Data to Orphan Branch
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          commit_message: "Updated weather tiles: ${{ github.event.repository.updated_at }}"
-          file_pattern: 'public/data/*.json'
-          branch: main
+          folder: public/data      # We only deploy the data folder
+          branch: weather-data     # The target branch (separate from main)
+          
+          # --- HISTORY MANAGEMENT ---
+          single-commit: true      # Wipes history of this branch every run!
+          force: true              # Forces the overwrite
+          clean: true              # Removes old files not in current build
