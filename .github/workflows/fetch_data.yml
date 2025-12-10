@@ -1,0 +1,46 @@
+name: Fetch All Weather Data
+
+on:
+  schedule:
+    # Run at 04:30, 10:30, 16:30, 22:30 UTC (to catch the 00, 06, 12, 18 runs)
+    - cron: '30 4,10,16,22 * * *'
+  workflow_dispatch: # Manual trigger button
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-and-tile:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (eccodes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libeccodes-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Libraries
+        run: |
+          pip install requests xarray cfgrib numpy argparse
+
+      # You can split this into multiple steps if you want to fail gracefully
+      - name: Fetch Data Layers
+        run: |
+          # Fetching 'all' might take 10-15 minutes. 
+          # GitHub Actions timeout is usually 6 hours, so this is fine.
+          python scripts/fetch_weather_data.py --type all
+
+      - name: Deploy to Branch
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Updated weather tiles: ${{ github.event.repository.updated_at }}"
+          file_pattern: 'public/data/*.json'
+          branch: main
