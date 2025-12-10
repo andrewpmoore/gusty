@@ -39,7 +39,7 @@ jobs:
       - name: Deploy Data to Separate Repo
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          token: ${{ secrets.DATA_REPO_TOKEN }}  # Use the PAT we just made
+          token: ${{ secrets.DATA_REPO_SECRET }}  # Use the PAT we just made
           repository-name: andrewpmoore/gusty-data # <--- TARGET REPO
           folder: public/data
           branch: main             # Push to main branch of the data repo
