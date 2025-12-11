@@ -20,7 +20,6 @@
             animation: pulse 2s infinite;
         }
         
-        /* Speedometer */
         .hud-item span { font-size: 40px; }
         .label { font-size: 14px; opacity: 0.7; }
 
@@ -44,7 +43,7 @@
         /* Mobile Controls */
         #zone_joystick {
             position: absolute; bottom: 50px; left: 50px; width: 150px; height: 150px;
-            z-index: 5; pointer-events: auto; display: none; /* Hidden on desktop by default logic */
+            z-index: 5; pointer-events: auto; display: none; 
         }
 
         /* Animations */
@@ -60,7 +59,17 @@
             text-shadow: 0 0 20px #ff00ff;
         }
     </style>
+    
     <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.1/nipple.min.js"></script>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
 </head>
 <body>
 
@@ -88,10 +97,11 @@
     </div>
 
     <script type="module">
-        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-        import { EffectComposer } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/EffectComposer.js';
-        import { RenderPass } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/RenderPass.js';
-        import { UnrealBloomPass } from 'https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+        // Now we can import from 'three' directly because of the map above
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
         // --- Configuration ---
         const CONFIG = {
@@ -105,7 +115,7 @@
             acceleration: 0.05,
             friction: 0.96,
             turnSpeed: 0.06,
-            driftFactor: 0.93 // Lower = more slippery
+            driftFactor: 0.93
         };
 
         // --- Audio System (Synthesized) ---
@@ -114,17 +124,14 @@
                 this.ctx = new (window.AudioContext || window.webkitAudioContext)();
                 this.engineOsc = null;
                 this.engineGain = null;
-                this.isMuted = false;
             }
 
             init() {
-                // Engine Sound
                 this.engineOsc = this.ctx.createOscillator();
                 this.engineOsc.type = 'sawtooth';
                 this.engineGain = this.ctx.createGain();
                 this.engineGain.gain.value = 0;
                 
-                // Lowpass filter to muffule the harsh sawtooth
                 const filter = this.ctx.createBiquadFilter();
                 filter.type = 'lowpass';
                 filter.frequency.value = 400;
@@ -137,10 +144,8 @@
 
             updateEngine(speedRatio) {
                 if (!this.engineOsc) return;
-                // Pitch rises with speed
                 const baseFreq = 60;
                 this.engineOsc.frequency.setTargetAtTime(baseFreq + (speedRatio * 200), this.ctx.currentTime, 0.1);
-                // Volume rises with speed
                 this.engineGain.gain.setTargetAtTime(0.05 + (speedRatio * 0.1), this.ctx.currentTime, 0.1);
             }
 
@@ -169,7 +174,7 @@
         
         let velocity = new THREE.Vector3();
         let currentSpeed = 0;
-        let input = { x: 0, y: 0 }; // x = steering, y = throttle
+        let input = { x: 0, y: 0 }; 
         let isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
         
         const audio = new SynthAudio();
@@ -178,7 +183,6 @@
 
         // --- Init ---
         function init() {
-            // Scene Setup
             scene = new THREE.Scene();
             scene.fog = new THREE.FogExp2(0x000000, 0.002);
 
@@ -187,46 +191,34 @@
 
             renderer = new THREE.WebGLRenderer({ antialias: false });
             renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Perf optimization
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
             document.getElementById('canvas-container').appendChild(renderer.domElement);
 
-            // Post Processing (BLOOM)
             const renderScene = new RenderPass(scene, camera);
             const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
             bloomPass.threshold = 0;
-            bloomPass.strength = 1.8; // High glow
+            bloomPass.strength = 1.8;
             bloomPass.radius = 0.5;
 
             composer = new EffectComposer(renderer);
             composer.addPass(renderScene);
             composer.addPass(bloomPass);
 
-            // Environment
             createGrid();
             createPlayer();
             createTrail();
             
-            // Random Speed Pads
-            for(let i=0; i<15; i++) {
-                createSpeedPad();
-            }
+            for(let i=0; i<15; i++) createSpeedPad();
 
-            // Inputs
             setupInputs();
-
-            // Resize Handler
             window.addEventListener('resize', onWindowResize, false);
-            
-            // Start Loop
             requestAnimationFrame(animate);
         }
 
         function createGrid() {
-            // Main floor grid
             const gridHelper = new THREE.GridHelper(2000, 200, CONFIG.gridGlow, CONFIG.gridColor);
             scene.add(gridHelper);
 
-            // Infinite Floor Plane (Invisible, for reflections if we added them, but mainly to hide "below")
             const planeGeometry = new THREE.PlaneGeometry(2000, 2000);
             const planeMaterial = new THREE.MeshBasicMaterial({ color: 0x050505 });
             const plane = new THREE.Mesh(planeGeometry, planeMaterial);
@@ -238,24 +230,20 @@
         function createPlayer() {
             player = new THREE.Group();
 
-            // Chassis
             const bodyGeo = new THREE.BoxGeometry(1, 0.5, 2.5);
-            const bodyMat = new THREE.MeshBasicMaterial({ color: 0x000000 }); // Black core
+            const bodyMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
             const body = new THREE.Mesh(bodyGeo, bodyMat);
             
-            // Glowing Edges/Shell
             const shellGeo = new THREE.BoxGeometry(1.05, 0.55, 2.55);
             const shellMat = new THREE.MeshBasicMaterial({ color: CONFIG.color, wireframe: true });
             const shell = new THREE.Mesh(shellGeo, shellMat);
 
-            // Rear Wheel (Light Block)
             const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.8, 16);
             wheelGeo.rotateZ(Math.PI / 2);
             const wheelMat = new THREE.MeshBasicMaterial({ color: CONFIG.color });
             const rearWheel = new THREE.Mesh(wheelGeo, wheelMat);
             rearWheel.position.set(0, -0.1, -1);
 
-            // Front Wheel
             const frontWheel = rearWheel.clone();
             frontWheel.position.set(0, -0.1, 1);
 
@@ -269,8 +257,6 @@
         }
 
         function createTrail() {
-            // Using a strip for a wall-like trail
-            // Initialize with dummy data
             const count = MAX_TRAIL_LENGTH * 2;
             const geometry = new THREE.BufferGeometry();
             const positions = new Float32Array(count * 3);
@@ -292,30 +278,25 @@
             const geo = new THREE.BoxGeometry(4, 0.1, 6);
             const mat = new THREE.MeshBasicMaterial({ color: CONFIG.boostColor });
             const pad = new THREE.Mesh(geo, mat);
-            
-            // Random position
             pad.position.x = (Math.random() - 0.5) * 400;
             pad.position.z = (Math.random() - 0.5) * 400;
             pad.position.y = 0.05;
-            
             scene.add(pad);
             speedPads.push(pad);
         }
 
         function setupInputs() {
-            // Keyboard
             document.addEventListener('keydown', (e) => {
                 if (e.key === 'ArrowUp' || e.key === 'w') input.y = 1;
                 if (e.key === 'ArrowDown' || e.key === 's') input.y = -1;
-                if (e.key === 'ArrowLeft' || e.key === 'a') input.x = 1; // Left
-                if (e.key === 'ArrowRight' || e.key === 'd') input.x = -1; // Right
+                if (e.key === 'ArrowLeft' || e.key === 'a') input.x = 1; 
+                if (e.key === 'ArrowRight' || e.key === 'd') input.x = -1; 
             });
             document.addEventListener('keyup', (e) => {
                 if (['ArrowUp', 'w', 'ArrowDown', 's'].includes(e.key)) input.y = 0;
                 if (['ArrowLeft', 'a', 'ArrowRight', 'd'].includes(e.key)) input.x = 0;
             });
 
-            // Mobile Joystick
             if (isMobile) {
                 const zone = document.getElementById('zone_joystick');
                 zone.style.display = 'block';
@@ -330,7 +311,7 @@
                     const forward = Math.sin(data.angle.radian);
                     const turn = Math.cos(data.angle.radian);
                     input.y = forward;
-                    input.x = -turn; // Invert for steering
+                    input.x = -turn; 
                 });
                 manager.on('end', () => {
                     input.x = 0;
@@ -339,50 +320,32 @@
             }
         }
 
-        // --- Physics & Logic ---
         function updatePhysics() {
             if (!player) return;
 
-            // Acceleration
             if (input.y > 0) currentSpeed += CONFIG.acceleration;
             else if (input.y < 0) currentSpeed -= CONFIG.acceleration;
-            
-            // Friction
             currentSpeed *= CONFIG.friction;
             
-            // Cap speed (allow overspeed if boosted)
             if (currentSpeed > CONFIG.maxSpeed && currentSpeed < CONFIG.boostSpeed) {
                 currentSpeed = Math.max(CONFIG.maxSpeed, currentSpeed * 0.99); 
             }
 
-            // Turning (Drift mechanic: rotate player faster than velocity vector updates)
             if (Math.abs(currentSpeed) > 0.1) {
                 player.rotation.y += input.x * CONFIG.turnSpeed;
-                
-                // Lean into turn
                 player.rotation.z = -input.x * 0.3 * (Math.abs(currentSpeed)/CONFIG.maxSpeed);
             } else {
-                player.rotation.z *= 0.9; // Straighten up
+                player.rotation.z *= 0.9; 
             }
 
-            // Velocity Calculation
             const forwardDir = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotation.y);
-            
-            // Drift logic: Mix current velocity with new forward direction
-            // High drift factor = sticky, Low = icy
             velocity.x = velocity.x * CONFIG.driftFactor + forwardDir.x * currentSpeed * (1 - CONFIG.driftFactor);
             velocity.z = velocity.z * CONFIG.driftFactor + forwardDir.z * currentSpeed * (1 - CONFIG.driftFactor);
 
-            // Apply Move
             player.position.add(velocity);
 
-            // Speed Pad Collision
             checkCollisions();
-
-            // Audio Pitch
             audio.updateEngine(Math.abs(currentSpeed) / CONFIG.maxSpeed);
-
-            // HUD
             hudSpeed.innerText = Math.floor(Math.abs(currentSpeed) * 100);
         }
 
@@ -391,18 +354,11 @@
             speedPads.forEach(pad => {
                 const padBox = new THREE.Box3().setFromObject(pad);
                 if (pBox.intersectsBox(padBox)) {
-                    // Boost!
                     const boostVec = new THREE.Vector3(0,0,1).applyAxisAngle(new THREE.Vector3(0,1,0), player.rotation.y);
                     currentSpeed = CONFIG.boostSpeed;
-                    
-                    // UI Feedback
                     boostMsg.style.display = 'block';
                     setTimeout(() => boostMsg.style.display = 'none', 1000);
-                    
-                    // Sound
                     audio.playBoost();
-
-                    // Move pad to new random location so we can hit it again
                     pad.position.x = (Math.random() - 0.5) * 400;
                     pad.position.z = (Math.random() - 0.5) * 400;
                 }
@@ -410,17 +366,13 @@
         }
 
         function updateCamera() {
-            // Smooth follow
-            const relativeOffset = new THREE.Vector3(0, 3, -8); // Behind and up
+            const relativeOffset = new THREE.Vector3(0, 3, -8);
             const cameraOffset = relativeOffset.applyMatrix4(player.matrixWorld);
-            
             camera.position.lerp(cameraOffset, 0.1);
             camera.lookAt(player.position);
         }
 
         function updateTrail() {
-            // Add current point
-            // We store two points per frame: Top of wall and Bottom of wall
             const left = new THREE.Vector3(-0.4, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), player.rotation.y).add(player.position);
             const right = new THREE.Vector3(0.4, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), player.rotation.y).add(player.position);
 
@@ -433,24 +385,18 @@
                 trailPoints.shift();
             }
 
-            // Update Geometry
             const positions = trailMesh.geometry.attributes.position.array;
             let idx = 0;
-            // Loop backwards (newest to oldest) or forwards. 
-            // We need to fill the buffer.
             for (let i = 0; i < MAX_TRAIL_LENGTH; i++) {
                 if (i < trailPoints.length) {
                     const p = trailPoints[trailPoints.length - 1 - i];
-                    // Vertex 1 (Top)
                     positions[idx++] = p.top.x;
                     positions[idx++] = p.top.y;
                     positions[idx++] = p.top.z;
-                    // Vertex 2 (Bottom)
                     positions[idx++] = p.bottom.x;
                     positions[idx++] = p.bottom.y;
                     positions[idx++] = p.bottom.z;
                 } else {
-                    // Collapse unused vertices to player pos
                     positions[idx++] = player.position.x;
                     positions[idx++] = player.position.y;
                     positions[idx++] = player.position.z;
@@ -477,7 +423,6 @@
             composer.render();
         }
 
-        // Start Button Logic
         document.getElementById('start-btn').addEventListener('click', () => {
             document.getElementById('start-screen').style.display = 'none';
             audio.init();
