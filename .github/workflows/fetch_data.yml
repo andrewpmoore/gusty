@@ -2,9 +2,8 @@ name: Fetch Weather Data
 
 on:
   schedule:
-    # Run every 6 hours (04:30, 10:30, etc. UTC)
     - cron: '30 4,10,16,22 * * *'
-  workflow_dispatch: # Allows manual run button
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,13 +35,44 @@ jobs:
           # This script cleans public/data locally and then fills it with new JSONs
           python fetch_weather_data.py --type all
 
-      - name: Deploy Data to Separate Repo
-        uses: JamesIves/github-pages-deploy-action@v4
-        with:
-          token: ${{ secrets.DATA_REPO_SECRET }}  # Use the PAT we just made
-          repository-name: andrewpmoore/gusty-data # <--- TARGET REPO
-          folder: public/data
-          branch: main             # Push to main branch of the data repo
-          single-commit: true      # Delete history every time
-          force: true
-          clean: true
+      - name: Deploy Data (Keep Exactly 2 Commits)
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+        run: |
+          # 1. Download the PREVIOUS state of your data repo (depth=1 gets only the latest files)
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" previous_data || true
+          
+          # 2. Remove the downloaded .git folder so we can build a brand new history
+          rm -rf previous_data/.git
+          
+          # 3. Create a staging area for our deployment
+          mkdir deploy_staging
+          cd deploy_staging
+          
+          # Initialize a fresh git repository
+          git init
+          git branch -M main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 4. Commit the OLD data (This becomes Commit #1)
+          if [ -d "../previous_data" ]; then
+            cp -a ../previous_data/. .
+            git add .
+            git commit -m "Previous Weather Data"
+          else
+            # Failsafe for the very first run if the repo is entirely empty
+            echo "Init" > init.txt
+            git add init.txt
+            git commit -m "Initial Commit"
+          fi
+          
+          # 5. Commit the NEW data (This becomes Commit #2)
+          # We copy the new data over the old data, replacing files
+          cp -a ../public/data/. .
+          git add .
+          git commit -m "Latest Weather Data: $(date -u)"
+          
+          # 6. Force Push
+          # This overwrites the remote repository with our new, exact 2-commit history
+          git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force
