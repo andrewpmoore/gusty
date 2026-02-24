@@ -61,18 +61,18 @@ jobs:
             git add .
             git commit -m "Previous Weather Data"
           else
-            # Failsafe for the very first run if the repo is entirely empty
+            # Failsafe for the very first run
             echo "Init" > init.txt
             git add init.txt
             git commit -m "Initial Commit"
           fi
           
           # 5. Commit the NEW data (This becomes Commit #2)
-          # We copy the new data over the old data, replacing files
           cp -a ../public/data/. .
           git add .
-          git commit -m "Latest Weather Data: $(date -u)"
+          
+          # ADDED --allow-empty HERE to prevent crashing when data is identical
+          git commit --allow-empty -m "Latest Weather Data: $(date -u)"
           
           # 6. Force Push
-          # This overwrites the remote repository with our new, exact 2-commit history
           git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force
