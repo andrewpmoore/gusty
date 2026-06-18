@@ -320,9 +320,17 @@ def make_components(subset, config, job_type, sample_step=1):
 
     return components
 
-def build_pack_overview_tile(ds, config, job_type, pack_lat_start, pack_lon_start):
-    pack_lat_end = min(pack_lat_start + PACK_LAT_SIZE, 90)
-    pack_lon_end = min(pack_lon_start + PACK_LON_SIZE, 180)
+def build_pack_overview_tile(ds, config, job_type, tile_origins):
+    if not tile_origins:
+        return None
+
+    lat_starts = [lat_start for lat_start, _ in tile_origins]
+    lon_starts = [lon_start for _, lon_start in tile_origins]
+    pack_lat_start = min(lat_starts)
+    pack_lat_end = min(max(lat_starts) + TILE_SIZE, 90)
+    pack_lon_start = min(lon_starts)
+    pack_lon_end = min(max(lon_starts) + TILE_SIZE, 180)
+
     subset = ds.sel(
         latitude=slice(pack_lat_end, pack_lat_start),
         longitude=slice(pack_lon_start, pack_lon_end)
@@ -379,16 +387,20 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                 tile_path = os.path.join(job_dir, filename)
                 write_binary_tile(tile_path, lon_vals, lat_vals, dx, dy, components)
                 pack_start = pack_origin(lat_start, lon_start)
-                pack_entries.setdefault(pack_start, []).append((tile_key(lat_start, lon_start), tile_path))
+                pack_entries.setdefault(pack_start, []).append(
+                    (tile_key(lat_start, lon_start), tile_path, lat_start, lon_start)
+                )
                 count += 1
 
         pack_count = 0
-        for (pack_lat_start, pack_lon_start), entries in pack_entries.items():
+        for (pack_lat_start, pack_lon_start), pack_tiles in pack_entries.items():
             pack_path = os.path.join(
                 job_dir,
                 pack_filename(job_type, forecast_hour, pack_lat_start, pack_lon_start)
             )
-            overview_tile = build_pack_overview_tile(ds, config, job_type, pack_lat_start, pack_lon_start)
+            entries = [(key, tile_path) for key, tile_path, _, _ in pack_tiles]
+            tile_origins = [(lat_start, lon_start) for _, _, lat_start, lon_start in pack_tiles]
+            overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins)
             if overview_tile:
                 entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
             write_tile_pack(pack_path, entries)
