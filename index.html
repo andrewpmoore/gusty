@@ -6,6 +6,16 @@
 	<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
 
 	<meta name="viewport" content="width=device-width">
+	<meta http-equiv="refresh" content="0; url=https://www.gustyweather.com/">
+	<link rel="canonical" href="https://www.gustyweather.com/">
+	<script>
+		const target = new URL("https://www.gustyweather.com/");
+		const sourcePath = window.location.pathname.replace(/^\/gusty\/?/, "");
+		target.pathname = `/${sourcePath}`;
+		target.search = window.location.search;
+		target.hash = window.location.hash;
+		window.location.replace(target.toString());
+	</script>
 	<title>Gusty Weather</title>
 
 	<!-- Fonts -->
