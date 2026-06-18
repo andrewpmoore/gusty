@@ -6,6 +6,7 @@ import time
 import json
 import argparse
 import sys
+import struct
 import numpy as np
 import xarray as xr
 
@@ -15,67 +16,83 @@ NOAA_CONFIG = {
         "type": "gfs_atmos",
         "vars": {"var_UGRD": "on", "var_VGRD": "on"},
         "level": {"lev_10_m_above_ground": "on"},
-        "json_type": "vector"
+        "grid_type": "vector"
     },
     "gusts": {
         "type": "gfs_atmos",
         "vars": {"var_GUST": "on"},
         "level": {"lev_surface": "on"},
-        "json_type": "scalar" # Gust is a single speed value (m/s), not a vector
+        "grid_type": "scalar" # Gust is a single speed value (m/s), not a vector
     },
     "temp": {
         "type": "gfs_atmos",
         "vars": {"var_TMP": "on"},
         "level": {"lev_2_m_above_ground": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "humidity": {
         "type": "gfs_atmos",
         "vars": {"var_RH": "on"},
         "level": {"lev_2_m_above_ground": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "pressure": {
         "type": "gfs_atmos",
         "vars": {"var_PRMSL": "on"},
         "level": {"lev_mean_sea_level": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "waves": {
         "type": "direct_download", 
         "vars": {}, 
         "level": {},
-        "json_type": "vector"
+        "grid_type": "vector"
     },
     "smoke": {
         "type": "gefs_aero", 
         "vars": {"var_PMTF": "on"}, 
         "level": {"lev_surface": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "dust": {
         "type": "gefs_aero",
         "vars": {"var_DUST": "on"}, 
         "level": {"lev_surface": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "snow": {
         "type": "gfs_atmos",
         "vars": {"var_SNOD": "on"},
         "level": {"lev_surface": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     },
     "cape": {
         "type": "gfs_atmos",
         "vars": {"var_CAPE": "on"},
         "level": {"lev_surface": "on"},
-        "json_type": "scalar"
+        "grid_type": "scalar"
     }
 }
 
 OUTPUT_DIR = "public/data"
 HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
 TILE_SIZE = 20
+TILE_FORMAT = {
+    "name": "gusty-grid",
+    "version": 1,
+    "extension": "gtile",
+    "encoding": "int16-quantized",
+    "endianness": "little",
+    "missing_value": -32768,
+    "decode_formula": "value = offset + raw * scale"
+}
+
+MAGIC = b"GSTY"
+VERSION = 1
+ENCODING_INT16_QUANTIZED = 1
+MISSING_VALUE = -32768
+INT16_MIN_VALUE = -32767
+INT16_MAX_VALUE = 32767
 
 def clean_output_directory():
     """Wipes the output directory."""
@@ -95,6 +112,65 @@ def get_latest_run_time():
         prev_day = check_time - datetime.timedelta(days=1)
         date_str = prev_day.strftime("%Y%m%d")
     return date_str, f"{run_hour:02d}"
+
+def tile_filename(job_type, forecast_hour, lat_start, lon_start):
+    lat_label = f"N{abs(lat_start)}" if lat_start >= 0 else f"S{abs(lat_start)}"
+    lon_label = f"E{abs(lon_start)}" if lon_start >= 0 else f"W{abs(lon_start)}"
+    return f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.{TILE_FORMAT['extension']}"
+
+def precision_for_job(job_type):
+    return 3 if job_type in ["snow", "smoke", "dust"] else 1
+
+def prepare_grid_values(values, precision):
+    filled = np.where(np.isnan(values), 0, values)
+    return np.round(filled.astype(np.float32), precision).flatten()
+
+def quantize_int16(values):
+    min_value = float(np.min(values))
+    max_value = float(np.max(values))
+
+    if min_value == max_value:
+        return np.zeros(values.shape, dtype="<i2"), 1.0, min_value
+
+    scale = (max_value - min_value) / (INT16_MAX_VALUE - INT16_MIN_VALUE)
+    offset = (max_value + min_value) / 2.0
+    quantized = np.rint((values - offset) / scale)
+    quantized = np.clip(quantized, INT16_MIN_VALUE, INT16_MAX_VALUE).astype("<i2")
+    return quantized, float(scale), float(offset)
+
+def write_binary_tile(path, lon_vals, lat_vals, dx, dy, components):
+    expected_value_count = len(lon_vals) * len(lat_vals)
+    header = bytearray()
+    header.extend(MAGIC)
+    header.extend(struct.pack(
+        "<BBBBHHffff",
+        VERSION,
+        ENCODING_INT16_QUANTIZED,
+        len(components),
+        0,
+        len(lon_vals),
+        len(lat_vals),
+        float(lon_vals[0]),
+        float(lat_vals[0]),
+        float(dx),
+        float(dy)
+    ))
+
+    quantized_components = []
+    for parameter_number, values in components:
+        if values.size != expected_value_count:
+            raise ValueError(
+                f"Component {parameter_number} has {values.size} values, "
+                f"expected {expected_value_count}"
+            )
+        quantized, scale, offset = quantize_int16(values)
+        header.extend(struct.pack("<hff", int(parameter_number), scale, offset))
+        quantized_components.append(quantized)
+
+    with open(path, "wb") as f:
+        f.write(header)
+        for quantized in quantized_components:
+            f.write(quantized.tobytes())
 
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
@@ -118,38 +194,27 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                 subset = ds.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end))
                 if subset.latitude.size == 0 or subset.longitude.size == 0: continue
 
-                # Filename scheme
-                lat_label = f"N{abs(lat_start)}" if lat_start >= 0 else f"S{abs(lat_start)}"
-                lon_label = f"E{abs(lon_start)}" if lon_start >= 0 else f"W{abs(lon_start)}"
-                filename = f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.json"
+                filename = tile_filename(job_type, forecast_hour, lat_start, lon_start)
 
                 lat_vals = subset.latitude.values
                 lon_vals = subset.longitude.values
                 dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
                 dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
 
-                output_data = []
-
-                if config['json_type'] == 'vector':
+                components = []
+                if config['grid_type'] == 'vector':
                     data_vars = list(subset.data_vars)
                     if len(data_vars) < 2: continue
                     var1, var2 = subset[data_vars[0]], subset[data_vars[1]]
-                    flat1 = [round(float(x), 1) for x in np.where(np.isnan(var1.values), 0, var1.values).flatten()]
-                    flat2 = [round(float(x), 1) for x in np.where(np.isnan(var2.values), 0, var2.values).flatten()]
-                    output_data.append(make_record(lon_vals, lat_vals, dx, dy, 2, flat1, ref_time_iso))
-                    output_data.append(make_record(lon_vals, lat_vals, dx, dy, 3, flat2, ref_time_iso))
+                    components.append((2, prepare_grid_values(var1.values, 1)))
+                    components.append((3, prepare_grid_values(var2.values, 1)))
                 else:
                     data_vars = list(subset.data_vars)
                     if not data_vars: continue
                     var1 = subset[data_vars[0]]
-                    precision = 1
-                    if job_type in ['snow', 'smoke', 'dust']: precision = 3
-                    flat1 = [round(float(x), precision) for x in np.where(np.isnan(var1.values), 0, var1.values).flatten()]
-                    output_data.append(make_record(lon_vals, lat_vals, dx, dy, 0, flat1, ref_time_iso))
+                    components.append((0, prepare_grid_values(var1.values, precision_for_job(job_type))))
 
-                # --- SAVE INTO SUBDIRECTORY ---
-                with open(os.path.join(job_dir, filename), 'w') as f:
-                    json.dump(output_data, f)
+                write_binary_tile(os.path.join(job_dir, filename), lon_vals, lat_vals, dx, dy, components)
                 count += 1
 
         ds.close()
@@ -158,18 +223,6 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
     except Exception as e:
         print(f"❌ Error tiling {job_type}: {e}")
         return False, None, 0
-
-def make_record(lon, lat, dx, dy, p_num, data, ref_time):
-    return {
-        "header": {
-            "lo1": float(lon[0]), "la1": float(lat[0]),
-            "dx": float(dx), "dy": float(dy),
-            "nx": len(lon), "ny": len(lat),
-            "parameterNumber": p_num,
-            "refTime": ref_time
-        },
-        "data": data
-    }
 
 def download_and_process(job_type, date, run_hour, forecast_hour):
     if job_type not in NOAA_CONFIG: return None, 0
@@ -238,7 +291,12 @@ if __name__ == "__main__":
             time.sleep(1)
         
         if job_ref_time:
-            manifest_updates[job] = {"ref_time": job_ref_time, "tiles": total_tiles}
+            manifest_updates[job] = {
+                "ref_time": job_ref_time,
+                "tiles": total_tiles,
+                "grid_type": NOAA_CONFIG[job]["grid_type"],
+                "tile_format": TILE_FORMAT
+            }
 
     if manifest_updates:
         print("\n✅ Batch Complete.")
