@@ -111,6 +111,8 @@ PACK_FORMAT = {
     "lat_size": PACK_LAT_SIZE,
     "lon_size": PACK_LON_SIZE,
     "contains": TILE_FORMAT["extension"],
+    "overview_key_suffix": "_60",
+    "overview_sample_step": 4,
     "offset_base": "start_of_data_section"
 }
 
@@ -122,6 +124,8 @@ INT16_MIN_VALUE = -32767
 INT16_MAX_VALUE = 32767
 PACK_MAGIC = b"GPAK"
 PACK_VERSION = 1
+OVERVIEW_KEY_SUFFIX = "_60"
+OVERVIEW_SAMPLE_STEP = 4
 
 def clean_output_directory():
     """Wipes the output directory."""
@@ -167,6 +171,9 @@ def pack_filename(job_type, forecast_hour, lat_start, lon_start):
     lat_label, lon_label = coordinate_label(lat_start, lon_start)
     return f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.{PACK_FORMAT['extension']}"
 
+def overview_tile_key(lat_start, lon_start):
+    return f"{tile_key(lat_start, lon_start)}{OVERVIEW_KEY_SUFFIX}"
+
 def precision_for_job(job_type):
     return 3 if job_type in ["snow", "smoke", "dust", "air_quality"] else 1
 
@@ -187,7 +194,7 @@ def quantize_int16(values):
     quantized = np.clip(quantized, INT16_MIN_VALUE, INT16_MAX_VALUE).astype("<i2")
     return quantized, float(scale), float(offset)
 
-def write_binary_tile(path, lon_vals, lat_vals, dx, dy, components):
+def build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components):
     expected_value_count = len(lon_vals) * len(lat_vals)
     header = bytearray()
     header.extend(MAGIC)
@@ -216,19 +223,27 @@ def write_binary_tile(path, lon_vals, lat_vals, dx, dy, components):
         header.extend(struct.pack("<hff", int(parameter_number), scale, offset))
         quantized_components.append(quantized)
 
+    output = bytearray(header)
+    for quantized in quantized_components:
+        output.extend(quantized.tobytes())
+    return bytes(output)
+
+def write_binary_tile(path, lon_vals, lat_vals, dx, dy, components):
+    tile_bytes = build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components)
     with open(path, "wb") as f:
-        f.write(header)
-        for quantized in quantized_components:
-            f.write(quantized.tobytes())
+        f.write(tile_bytes)
 
 def write_tile_pack(pack_path, entries):
     header = bytearray()
     data = bytearray()
     table = []
 
-    for key, tile_path in entries:
-        with open(tile_path, "rb") as f:
-            tile_bytes = f.read()
+    for key, tile_source in entries:
+        if isinstance(tile_source, bytes):
+            tile_bytes = tile_source
+        else:
+            with open(tile_source, "rb") as f:
+                tile_bytes = f.read()
         offset = len(data)
         data.extend(tile_bytes)
         table.append((key, offset, len(tile_bytes)))
@@ -281,6 +296,53 @@ def download_idx_message(base_url, idx_match, output_path):
     print(f"⚠️ NOAA IDX field not found: {' '.join(idx_match)}")
     return False
 
+def make_components(subset, config, job_type, sample_step=1):
+    components = []
+    data_vars = list(subset.data_vars)
+
+    if config['grid_type'] == 'vector':
+        if len(data_vars) < 2:
+            return components
+        var1, var2 = subset[data_vars[0]], subset[data_vars[1]]
+        components.append((2, prepare_grid_values(var1.values[::sample_step, ::sample_step], 1)))
+        components.append((3, prepare_grid_values(var2.values[::sample_step, ::sample_step], 1)))
+    else:
+        if not data_vars:
+            return components
+        var1 = subset[data_vars[0]]
+        components.append((
+            0,
+            prepare_grid_values(
+                var1.values[::sample_step, ::sample_step],
+                precision_for_job(job_type)
+            )
+        ))
+
+    return components
+
+def build_pack_overview_tile(ds, config, job_type, pack_lat_start, pack_lon_start):
+    pack_lat_end = min(pack_lat_start + PACK_LAT_SIZE, 90)
+    pack_lon_end = min(pack_lon_start + PACK_LON_SIZE, 180)
+    subset = ds.sel(
+        latitude=slice(pack_lat_end, pack_lat_start),
+        longitude=slice(pack_lon_start, pack_lon_end)
+    )
+    if subset.latitude.size == 0 or subset.longitude.size == 0:
+        return None
+
+    lat_vals = subset.latitude.values[::OVERVIEW_SAMPLE_STEP]
+    lon_vals = subset.longitude.values[::OVERVIEW_SAMPLE_STEP]
+    if len(lat_vals) == 0 or len(lon_vals) == 0:
+        return None
+
+    dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
+    dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
+    components = make_components(subset, config, job_type, OVERVIEW_SAMPLE_STEP)
+    if not components:
+        return None
+
+    return build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components)
+
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
@@ -311,18 +373,8 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                 dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
                 dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
 
-                components = []
-                if config['grid_type'] == 'vector':
-                    data_vars = list(subset.data_vars)
-                    if len(data_vars) < 2: continue
-                    var1, var2 = subset[data_vars[0]], subset[data_vars[1]]
-                    components.append((2, prepare_grid_values(var1.values, 1)))
-                    components.append((3, prepare_grid_values(var2.values, 1)))
-                else:
-                    data_vars = list(subset.data_vars)
-                    if not data_vars: continue
-                    var1 = subset[data_vars[0]]
-                    components.append((0, prepare_grid_values(var1.values, precision_for_job(job_type))))
+                components = make_components(subset, config, job_type)
+                if not components: continue
 
                 tile_path = os.path.join(job_dir, filename)
                 write_binary_tile(tile_path, lon_vals, lat_vals, dx, dy, components)
@@ -336,6 +388,9 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                 job_dir,
                 pack_filename(job_type, forecast_hour, pack_lat_start, pack_lon_start)
             )
+            overview_tile = build_pack_overview_tile(ds, config, job_type, pack_lat_start, pack_lon_start)
+            if overview_tile:
+                entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
             write_tile_pack(pack_path, entries)
             pack_count += 1
 

@@ -19,6 +19,8 @@
     "lat_size": 60,
     "lon_size": 80,
     "contains": "gtile",
+    "overview_key_suffix": "_60",
+    "overview_sample_step": 4,
     "offset_base": "start_of_data_section"
   }
 }
