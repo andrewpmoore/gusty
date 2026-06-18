@@ -37,6 +37,18 @@ NOAA_CONFIG = {
         "level": {"lev_2_m_above_ground": "on"},
         "grid_type": "scalar"
     },
+    "clouds": {
+        "type": "gfs_atmos",
+        "vars": {"var_TCDC": "on"},
+        "level": {"lev_entire_atmosphere": "on"},
+        "grid_type": "scalar"
+    },
+    "visibility": {
+        "type": "gfs_atmos",
+        "vars": {"var_VIS": "on"},
+        "level": {"lev_surface": "on"},
+        "grid_type": "scalar"
+    },
     "pressure": {
         "type": "gfs_atmos",
         "vars": {"var_PRMSL": "on"},
@@ -50,16 +62,19 @@ NOAA_CONFIG = {
         "grid_type": "vector"
     },
     "smoke": {
-        "type": "gefs_aero", 
-        "vars": {"var_PMTF": "on"}, 
-        "level": {"lev_surface": "on"},
-        "grid_type": "scalar"
+        "type": "gefs_chem_idx",
+        "grid_type": "scalar",
+        "idx_match": [":PMTF:surface:", "aerosol=Total Aerosol", "aerosol_size <2.5e-06"]
+    },
+    "air_quality": {
+        "type": "gefs_chem_idx",
+        "grid_type": "scalar",
+        "idx_match": [":PMTF:surface:", "aerosol=Total Aerosol", "aerosol_size <2.5e-06"]
     },
     "dust": {
-        "type": "gefs_aero",
-        "vars": {"var_DUST": "on"}, 
-        "level": {"lev_surface": "on"},
-        "grid_type": "scalar"
+        "type": "gefs_chem_idx",
+        "grid_type": "scalar",
+        "idx_match": [":PMTF:surface:", "aerosol=Dust Dry", "aerosol_size <2.5e-06"]
     },
     "snow": {
         "type": "gfs_atmos",
@@ -153,7 +168,7 @@ def pack_filename(job_type, forecast_hour, lat_start, lon_start):
     return f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.{PACK_FORMAT['extension']}"
 
 def precision_for_job(job_type):
-    return 3 if job_type in ["snow", "smoke", "dust"] else 1
+    return 3 if job_type in ["snow", "smoke", "dust", "air_quality"] else 1
 
 def prepare_grid_values(values, precision):
     filled = np.where(np.isnan(values), 0, values)
@@ -233,6 +248,39 @@ def write_tile_pack(pack_path, entries):
         f.write(header)
         f.write(data)
 
+def download_idx_message(base_url, idx_match, output_path):
+    idx_url = f"{base_url}.idx"
+    idx_response = requests.get(idx_url, timeout=60)
+    if idx_response.status_code != 200:
+        print(f"⚠️ NOAA IDX Error {idx_response.status_code}")
+        return False
+
+    rows = []
+    for line in idx_response.text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 3: continue
+        try:
+            offset = int(parts[1])
+        except ValueError:
+            continue
+        rows.append((line, offset))
+
+    for index, (line, start) in enumerate(rows):
+        if all(token in line for token in idx_match):
+            end = rows[index + 1][1] - 1 if index + 1 < len(rows) else None
+            headers = {"Range": f"bytes={start}-{end if end is not None else ''}"}
+            response = requests.get(base_url, headers=headers, stream=True, timeout=180)
+            if response.status_code not in (200, 206):
+                print(f"⚠️ NOAA Range Error {response.status_code}")
+                return False
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=16384):
+                    f.write(chunk)
+            return True
+
+    print(f"⚠️ NOAA IDX field not found: {' '.join(idx_match)}")
+    return False
+
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
@@ -308,6 +356,8 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
     
     if conf['type'] == 'direct_download':
         url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date}/{run_hour}/wave/gridded/gfswave.t{run_hour}z.global.0p25.f{f_str}.grib2"
+    elif conf['type'] == 'gefs_chem_idx':
+        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.{date}/{run_hour}/chem/pgrb2ap25/gefs.chem.t{run_hour}z.a2d_0p25.f{f_str}.grib2"
     elif conf['type'] == 'gefs_aero':
         url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gefs_aer_0p50.pl"
         server_file = f"gec00.t{run_hour}z.pgrb2a.0p50.f{f_str}"
@@ -323,6 +373,14 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
 
     try:
         print(f"⬇️ {job_type.upper()} f{f_str}...")
+        if conf['type'] == 'gefs_chem_idx':
+            downloaded = download_idx_message(url, conf["idx_match"], grib_path)
+            if not downloaded:
+                return None, 0, 0
+            success, ref_time, count, pack_count = generate_tiles(grib_path, forecast_hour, job_type, conf)
+            if os.path.exists(grib_path): os.remove(grib_path)
+            return ref_time, count, pack_count
+
         response = requests.get(url, params=params, stream=True, timeout=180)
         
         if response.status_code == 200:
