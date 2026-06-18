@@ -7,6 +7,7 @@ import json
 import argparse
 import sys
 import struct
+import math
 import numpy as np
 import xarray as xr
 
@@ -77,6 +78,8 @@ NOAA_CONFIG = {
 OUTPUT_DIR = "public/data"
 HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
 TILE_SIZE = 20
+PACK_LAT_SIZE = 60
+PACK_LON_SIZE = 80
 TILE_FORMAT = {
     "name": "gusty-grid",
     "version": 1,
@@ -86,6 +89,15 @@ TILE_FORMAT = {
     "missing_value": -32768,
     "decode_formula": "value = offset + raw * scale"
 }
+PACK_FORMAT = {
+    "name": "gusty-pack",
+    "version": 1,
+    "extension": "gpack",
+    "lat_size": PACK_LAT_SIZE,
+    "lon_size": PACK_LON_SIZE,
+    "contains": TILE_FORMAT["extension"],
+    "offset_base": "start_of_data_section"
+}
 
 MAGIC = b"GSTY"
 VERSION = 1
@@ -93,6 +105,8 @@ ENCODING_INT16_QUANTIZED = 1
 MISSING_VALUE = -32768
 INT16_MIN_VALUE = -32767
 INT16_MAX_VALUE = 32767
+PACK_MAGIC = b"GPAK"
+PACK_VERSION = 1
 
 def clean_output_directory():
     """Wipes the output directory."""
@@ -113,10 +127,30 @@ def get_latest_run_time():
         date_str = prev_day.strftime("%Y%m%d")
     return date_str, f"{run_hour:02d}"
 
-def tile_filename(job_type, forecast_hour, lat_start, lon_start):
+def coordinate_label(lat_start, lon_start):
     lat_label = f"N{abs(lat_start)}" if lat_start >= 0 else f"S{abs(lat_start)}"
     lon_label = f"E{abs(lon_start)}" if lon_start >= 0 else f"W{abs(lon_start)}"
-    return f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.{TILE_FORMAT['extension']}"
+    return lat_label, lon_label
+
+def tile_key(lat_start, lon_start):
+    lat_label, lon_label = coordinate_label(lat_start, lon_start)
+    return f"{lat_label}_{lon_label}"
+
+def tile_filename(job_type, forecast_hour, lat_start, lon_start):
+    return f"{job_type}_{forecast_hour}h_{tile_key(lat_start, lon_start)}.{TILE_FORMAT['extension']}"
+
+def pack_origin(lat_start, lon_start):
+    pack_lat_start = math.floor(lat_start / PACK_LAT_SIZE) * PACK_LAT_SIZE
+    pack_lat_start = max(-90, min(60, pack_lat_start))
+
+    # Anchor longitude packs so W120/W100/W80/W60 share one W120 pack.
+    pack_lon_start = math.floor((lon_start + 120) / PACK_LON_SIZE) * PACK_LON_SIZE - 120
+    pack_lon_start = max(-180, min(120, pack_lon_start))
+    return pack_lat_start, pack_lon_start
+
+def pack_filename(job_type, forecast_hour, lat_start, lon_start):
+    lat_label, lon_label = coordinate_label(lat_start, lon_start)
+    return f"{job_type}_{forecast_hour}h_{lat_label}_{lon_label}.{PACK_FORMAT['extension']}"
 
 def precision_for_job(job_type):
     return 3 if job_type in ["snow", "smoke", "dust"] else 1
@@ -172,6 +206,33 @@ def write_binary_tile(path, lon_vals, lat_vals, dx, dy, components):
         for quantized in quantized_components:
             f.write(quantized.tobytes())
 
+def write_tile_pack(pack_path, entries):
+    header = bytearray()
+    data = bytearray()
+    table = []
+
+    for key, tile_path in entries:
+        with open(tile_path, "rb") as f:
+            tile_bytes = f.read()
+        offset = len(data)
+        data.extend(tile_bytes)
+        table.append((key, offset, len(tile_bytes)))
+
+    header.extend(PACK_MAGIC)
+    header.extend(struct.pack("<BH", PACK_VERSION, len(table)))
+
+    for key, offset, length in table:
+        key_bytes = key.encode("utf-8")
+        if len(key_bytes) > 255:
+            raise ValueError(f"Pack key is too long: {key}")
+        header.extend(struct.pack("<B", len(key_bytes)))
+        header.extend(key_bytes)
+        header.extend(struct.pack("<II", offset, length))
+
+    with open(pack_path, "wb") as f:
+        f.write(header)
+        f.write(data)
+
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
@@ -185,6 +246,7 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
         os.makedirs(job_dir, exist_ok=True)
 
         count = 0
+        pack_entries = {}
         for lat_start in range(-90, 90, TILE_SIZE):
             for lon_start in range(-180, 180, TILE_SIZE):
                 
@@ -214,15 +276,27 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
                     var1 = subset[data_vars[0]]
                     components.append((0, prepare_grid_values(var1.values, precision_for_job(job_type))))
 
-                write_binary_tile(os.path.join(job_dir, filename), lon_vals, lat_vals, dx, dy, components)
+                tile_path = os.path.join(job_dir, filename)
+                write_binary_tile(tile_path, lon_vals, lat_vals, dx, dy, components)
+                pack_start = pack_origin(lat_start, lon_start)
+                pack_entries.setdefault(pack_start, []).append((tile_key(lat_start, lon_start), tile_path))
                 count += 1
 
+        pack_count = 0
+        for (pack_lat_start, pack_lon_start), entries in pack_entries.items():
+            pack_path = os.path.join(
+                job_dir,
+                pack_filename(job_type, forecast_hour, pack_lat_start, pack_lon_start)
+            )
+            write_tile_pack(pack_path, entries)
+            pack_count += 1
+
         ds.close()
-        return True, ref_time_iso, count
+        return True, ref_time_iso, count, pack_count
 
     except Exception as e:
         print(f"❌ Error tiling {job_type}: {e}")
-        return False, None, 0
+        return False, None, 0, 0
 
 def download_and_process(job_type, date, run_hour, forecast_hour):
     if job_type not in NOAA_CONFIG: return None, 0
@@ -255,15 +329,15 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
             with open(grib_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=16384):
                     f.write(chunk)
-            success, ref_time, count = generate_tiles(grib_path, forecast_hour, job_type, conf)
+            success, ref_time, count, pack_count = generate_tiles(grib_path, forecast_hour, job_type, conf)
             if os.path.exists(grib_path): os.remove(grib_path)
-            return ref_time, count
+            return ref_time, count, pack_count
         else:
             print(f"⚠️ NOAA Error {response.status_code}")
-            return None, 0
+            return None, 0, 0
     except Exception as e:
         print(f"❌ Exception: {e}")
-        return None, 0
+        return None, 0, 0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -284,18 +358,22 @@ if __name__ == "__main__":
         print(f"\n--- Processing: {job} ---")
         job_ref_time = None
         total_tiles = 0
+        total_packs = 0
         for hour in HOURS_TO_FETCH:
-            ref_time, count = download_and_process(job, date, run, hour)
+            ref_time, count, pack_count = download_and_process(job, date, run, hour)
             if ref_time: job_ref_time = ref_time
             total_tiles += count
+            total_packs += pack_count
             time.sleep(1)
         
         if job_ref_time:
             manifest_updates[job] = {
                 "ref_time": job_ref_time,
                 "tiles": total_tiles,
+                "packs": total_packs,
                 "grid_type": NOAA_CONFIG[job]["grid_type"],
-                "tile_format": TILE_FORMAT
+                "tile_format": TILE_FORMAT,
+                "pack_format": PACK_FORMAT
             }
 
     if manifest_updates:

@@ -11,5 +11,14 @@
     "endianness": "little",
     "missing_value": -32768,
     "decode_formula": "value = offset + raw * scale"
+  },
+  "pack_format": {
+    "name": "gusty-pack",
+    "version": 1,
+    "extension": "gpack",
+    "lat_size": 60,
+    "lon_size": 80,
+    "contains": "gtile",
+    "offset_base": "start_of_data_section"
   }
 }
