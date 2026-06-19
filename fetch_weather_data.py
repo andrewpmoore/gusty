@@ -97,14 +97,60 @@ NOAA_CONFIG = {
             },
             "composite_reflectivity": {
                 "idx_match": [":REFC:entire atmosphere:"]
+            },
+            "cin": {
+                "idx_match": [":CIN:surface:"],
+                "optional": True
+            },
+            "precipitation_rate": {
+                "idx_match": [":PRATE:surface:"],
+                "optional": True
+            },
+            "convective_precipitation_rate": {
+                "idx_match": [":CPRAT:surface:"],
+                "optional": True
+            },
+            "precipitable_water": {
+                "idx_match": [":PWAT:entire atmosphere"],
+                "optional": True
+            },
+            "dewpoint": {
+                "idx_match": [":DPT:2 m above ground:"],
+                "optional": True
+            },
+            "wind_u_500": {
+                "idx_match": [":UGRD:500 mb:"],
+                "optional": True
+            },
+            "wind_v_500": {
+                "idx_match": [":VGRD:500 mb:"],
+                "optional": True
+            },
+            "wind_u_850": {
+                "idx_match": [":UGRD:850 mb:"],
+                "optional": True
+            },
+            "wind_v_850": {
+                "idx_match": [":VGRD:850 mb:"],
+                "optional": True
             }
         },
         "metadata": {
             "units": "index",
             "value_range": [0, 100],
-            "description": "Colored storm-potential layer derived from GFS surface CAPE and forecast composite reflectivity.",
-            "source_fields": ["CAPE_surface", "REFC_entire_atmosphere"],
-            "formula": "0.35 * CAPE score + 0.65 * CAPE/refc overlap score, scaled to 0-100"
+            "description": "Colored storm-potential layer derived from GFS instability, modeled convection, moisture, cap strength, and deep-layer shear.",
+            "source_fields": [
+                "CAPE_surface",
+                "REFC_entire_atmosphere",
+                "CIN_surface_optional",
+                "PRATE_surface_optional",
+                "CPRAT_surface_optional",
+                "PWAT_entire_atmosphere_optional",
+                "DPT_2m_optional",
+                "UGRD/VGRD_500mb_optional",
+                "UGRD/VGRD_850mb_optional"
+            ],
+            "formula": "Instability blended with reflectivity/precipitation overlap, moisture support, CIN suppression, and optional 850-500 mb shear boost; scaled to 0-100"
         }
     },
     "storm_motion": {
@@ -117,6 +163,42 @@ NOAA_CONFIG = {
             "composite_reflectivity": {
                 "idx_match": [":REFC:entire atmosphere:"]
             },
+            "cin": {
+                "idx_match": [":CIN:surface:"],
+                "optional": True
+            },
+            "precipitation_rate": {
+                "idx_match": [":PRATE:surface:"],
+                "optional": True
+            },
+            "convective_precipitation_rate": {
+                "idx_match": [":CPRAT:surface:"],
+                "optional": True
+            },
+            "precipitable_water": {
+                "idx_match": [":PWAT:entire atmosphere"],
+                "optional": True
+            },
+            "dewpoint": {
+                "idx_match": [":DPT:2 m above ground:"],
+                "optional": True
+            },
+            "wind_u_500": {
+                "idx_match": [":UGRD:500 mb:"],
+                "optional": True
+            },
+            "wind_v_500": {
+                "idx_match": [":VGRD:500 mb:"],
+                "optional": True
+            },
+            "wind_u_850": {
+                "idx_match": [":UGRD:850 mb:"],
+                "optional": True
+            },
+            "wind_v_850": {
+                "idx_match": [":VGRD:850 mb:"],
+                "optional": True
+            },
             "wind_u": {
                 "idx_match": [":UGRD:700 mb:"]
             },
@@ -127,8 +209,14 @@ NOAA_CONFIG = {
         "metadata": {
             "units": "m/s weighted by storm potential",
             "description": "Optional vector storm-motion layer for particles/arrows, using 700 mb steering wind weighted by the storm-potential score.",
-            "source_fields": ["CAPE_surface", "REFC_entire_atmosphere", "UGRD_700mb", "VGRD_700mb"],
-            "formula": "U/V steering wind multiplied by a 0-1 storm score from CAPE and composite reflectivity"
+            "source_fields": [
+                "CAPE_surface",
+                "REFC_entire_atmosphere",
+                "optional storm-potential ingredients",
+                "UGRD_700mb",
+                "VGRD_700mb"
+            ],
+            "formula": "U/V steering wind multiplied by a 0-1 storm score from the storm-potential formula"
         }
     }
 }
@@ -504,16 +592,77 @@ def first_data_array(ds):
         raise ValueError("No data variables found")
     return ds[data_vars[0]]
 
-def storm_potential_index(cape, composite_reflectivity):
+def storm_potential_index(
+    cape,
+    composite_reflectivity,
+    cin=None,
+    precipitation_rate=None,
+    convective_precipitation_rate=None,
+    precipitable_water=None,
+    dewpoint=None,
+    wind_u_500=None,
+    wind_v_500=None,
+    wind_u_850=None,
+    wind_v_850=None
+):
     cape_score = ((cape - 250.0) / 1750.0).clip(0.0, 1.0)
-    reflectivity_score = ((composite_reflectivity - 20.0) / 35.0).clip(0.0, 1.0)
+    reflectivity_score = ((composite_reflectivity - 18.0) / 37.0).clip(0.0, 1.0)
+    precip_scores = []
+
+    if precipitation_rate is not None:
+        # GFS PRATE/CPRAT is kg m-2 s-1, which is equivalent to mm/s for water.
+        precip_scores.append(((precipitation_rate * 3600.0 - 0.25) / 8.0).clip(0.0, 1.0))
+    if convective_precipitation_rate is not None:
+        precip_scores.append(((convective_precipitation_rate * 3600.0 - 0.10) / 5.0).clip(0.0, 1.0))
+
+    convective_signal = reflectivity_score
+    for score in precip_scores:
+        convective_signal = xr.where(convective_signal >= score, convective_signal, score)
 
     # CAPE identifies unstable air, while composite reflectivity anchors the signal
     # to model-predicted convection. The overlap term keeps broad unstable air from
     # becoming a blanket high-risk layer by itself.
-    overlap_score = np.sqrt(cape_score) * np.power(reflectivity_score, 0.7)
-    index = (0.35 * cape_score) + (0.65 * overlap_score)
+    overlap_score = np.sqrt(cape_score) * np.power(convective_signal, 0.7)
+    index = (0.25 * cape_score) + (0.55 * overlap_score) + (0.20 * convective_signal * cape_score)
+
+    moisture_scores = []
+    if precipitable_water is not None:
+        moisture_scores.append(((precipitable_water - 20.0) / 25.0).clip(0.0, 1.0))
+    if dewpoint is not None:
+        dewpoint_c = xr.where(dewpoint > 150.0, dewpoint - 273.15, dewpoint)
+        moisture_scores.append(((dewpoint_c - 12.0) / 12.0).clip(0.0, 1.0))
+
+    if moisture_scores:
+        moisture_score = moisture_scores[0]
+        for score in moisture_scores[1:]:
+            moisture_score = xr.where(moisture_score >= score, moisture_score, score)
+        index = index * (0.55 + (0.45 * moisture_score))
+
+    if cin is not None:
+        cin_abs = np.abs(cin)
+        cap_release_score = (1.0 - ((cin_abs - 25.0) / 175.0).clip(0.0, 1.0)).clip(0.0, 1.0)
+        index = index * (0.35 + (0.65 * cap_release_score))
+
+    if all(item is not None for item in [wind_u_500, wind_v_500, wind_u_850, wind_v_850]):
+        shear = np.sqrt(
+            np.square(wind_u_500 - wind_u_850) +
+            np.square(wind_v_500 - wind_v_850)
+        )
+        shear_score = ((shear - 8.0) / 18.0).clip(0.0, 1.0)
+        index = index * (0.85 + (0.30 * shear_score))
+
     return index.clip(0.0, 1.0)
+
+def open_optional_storm_sources(source_paths, source_datasets, source_names):
+    optional_arrays = {}
+    for source_name in source_names:
+        path = source_paths.get(source_name)
+        if not path:
+            continue
+        ds = normalize_dataset_coordinates(xr.open_dataset(path, engine='cfgrib'))
+        source_datasets.append(ds)
+        optional_arrays[source_name] = first_data_array(ds).astype(np.float32)
+    return optional_arrays
 
 def download_and_process_storm_potential(job_type, date, run_hour, forecast_hour, config):
     source_paths = {}
@@ -526,6 +675,9 @@ def download_and_process_storm_potential(job_type, date, run_hour, forecast_hour
             path = os.path.join(OUTPUT_DIR, f"temp_{job_type}_{source_name}_{forecast_hour}.grib2")
             print(f"⬇️ {job_type.upper()} {source_name} f{f_str}...")
             if not download_idx_message(base_url, source_config["idx_match"], path):
+                if source_config.get("optional", False):
+                    print(f"   ↪️ Optional storm source skipped: {source_name}")
+                    continue
                 return None, 0, 0
             source_paths[source_name] = path
 
@@ -533,8 +685,49 @@ def download_and_process_storm_potential(job_type, date, run_hour, forecast_hour
         refc_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["composite_reflectivity"], engine='cfgrib'))
         source_datasets.extend([cape_ds, refc_ds])
 
-        cape, refc = xr.align(first_data_array(cape_ds), first_data_array(refc_ds), join="inner")
-        storm_score = storm_potential_index(cape.astype(np.float32), refc.astype(np.float32))
+        optional_source_names = [
+            "cin",
+            "precipitation_rate",
+            "convective_precipitation_rate",
+            "precipitable_water",
+            "dewpoint",
+            "wind_u_500",
+            "wind_v_500",
+            "wind_u_850",
+            "wind_v_850"
+        ]
+        optional_arrays = open_optional_storm_sources(
+            source_paths,
+            source_datasets,
+            optional_source_names
+        )
+
+        align_names = list(optional_arrays.keys())
+        aligned = xr.align(
+            first_data_array(cape_ds).astype(np.float32),
+            first_data_array(refc_ds).astype(np.float32),
+            *[optional_arrays[name] for name in align_names],
+            join="inner"
+        )
+        cape = aligned[0]
+        refc = aligned[1]
+        optional_arrays = {
+            name: aligned[index + 2]
+            for index, name in enumerate(align_names)
+        }
+        storm_score = storm_potential_index(
+            cape,
+            refc,
+            cin=optional_arrays.get("cin"),
+            precipitation_rate=optional_arrays.get("precipitation_rate"),
+            convective_precipitation_rate=optional_arrays.get("convective_precipitation_rate"),
+            precipitable_water=optional_arrays.get("precipitable_water"),
+            dewpoint=optional_arrays.get("dewpoint"),
+            wind_u_500=optional_arrays.get("wind_u_500"),
+            wind_v_500=optional_arrays.get("wind_v_500"),
+            wind_u_850=optional_arrays.get("wind_u_850"),
+            wind_v_850=optional_arrays.get("wind_v_850")
+        )
         if config["grid_type"] == "vector":
             wind_u_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["wind_u"], engine='cfgrib'))
             wind_v_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["wind_v"], engine='cfgrib'))
