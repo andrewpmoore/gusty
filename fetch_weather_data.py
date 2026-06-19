@@ -87,6 +87,49 @@ NOAA_CONFIG = {
         "vars": {"var_CAPE": "on"},
         "level": {"lev_surface": "on"},
         "grid_type": "scalar"
+    },
+    "storm_potential": {
+        "type": "derived_storm_potential",
+        "grid_type": "scalar",
+        "sources": {
+            "cape": {
+                "idx_match": [":CAPE:surface:"]
+            },
+            "composite_reflectivity": {
+                "idx_match": [":REFC:entire atmosphere:"]
+            }
+        },
+        "metadata": {
+            "units": "index",
+            "value_range": [0, 100],
+            "description": "Colored storm-potential layer derived from GFS surface CAPE and forecast composite reflectivity.",
+            "source_fields": ["CAPE_surface", "REFC_entire_atmosphere"],
+            "formula": "0.35 * CAPE score + 0.65 * CAPE/refc overlap score, scaled to 0-100"
+        }
+    },
+    "storm_motion": {
+        "type": "derived_storm_potential",
+        "grid_type": "vector",
+        "sources": {
+            "cape": {
+                "idx_match": [":CAPE:surface:"]
+            },
+            "composite_reflectivity": {
+                "idx_match": [":REFC:entire atmosphere:"]
+            },
+            "wind_u": {
+                "idx_match": [":UGRD:700 mb:"]
+            },
+            "wind_v": {
+                "idx_match": [":VGRD:700 mb:"]
+            }
+        },
+        "metadata": {
+            "units": "m/s weighted by storm potential",
+            "description": "Optional vector storm-motion layer for particles/arrows, using 700 mb steering wind weighted by the storm-potential score.",
+            "source_fields": ["CAPE_surface", "REFC_entire_atmosphere", "UGRD_700mb", "VGRD_700mb"],
+            "formula": "U/V steering wind multiplied by a 0-1 storm score from CAPE and composite reflectivity"
+        }
     }
 }
 
@@ -351,61 +394,69 @@ def build_pack_overview_tile(ds, config, job_type, tile_origins):
 
     return build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components)
 
+def normalize_dataset_coordinates(ds):
+    return ds.assign_coords(
+        longitude=(((ds.longitude + 180) % 360) - 180)
+    ).sortby('longitude')
+
+def generate_tiles_from_dataset(ds, forecast_hour, job_type, config):
+    ref_time_iso = str(ds.time.values)
+    print(f"   ✂️ Tiling {job_type}...")
+
+    # --- FOLDER MANAGEMENT ---
+    # Create a specific subfolder for this data type (e.g. public/data/wind)
+    job_dir = os.path.join(OUTPUT_DIR, job_type)
+    os.makedirs(job_dir, exist_ok=True)
+
+    count = 0
+    pack_entries = {}
+    for lat_start in range(-90, 90, TILE_SIZE):
+        for lon_start in range(-180, 180, TILE_SIZE):
+            lat_end = min(lat_start + TILE_SIZE, 90)
+            lon_end = min(lon_start + TILE_SIZE, 180)
+
+            subset = ds.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end))
+            if subset.latitude.size == 0 or subset.longitude.size == 0: continue
+
+            filename = tile_filename(job_type, forecast_hour, lat_start, lon_start)
+
+            lat_vals = subset.latitude.values
+            lon_vals = subset.longitude.values
+            dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
+            dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
+
+            components = make_components(subset, config, job_type)
+            if not components: continue
+
+            tile_path = os.path.join(job_dir, filename)
+            write_binary_tile(tile_path, lon_vals, lat_vals, dx, dy, components)
+            pack_start = pack_origin(lat_start, lon_start)
+            pack_entries.setdefault(pack_start, []).append(
+                (tile_key(lat_start, lon_start), tile_path, lat_start, lon_start)
+            )
+            count += 1
+
+    pack_count = 0
+    for (pack_lat_start, pack_lon_start), pack_tiles in pack_entries.items():
+        pack_path = os.path.join(
+            job_dir,
+            pack_filename(job_type, forecast_hour, pack_lat_start, pack_lon_start)
+        )
+        entries = [(key, tile_path) for key, tile_path, _, _ in pack_tiles]
+        tile_origins = [(lat_start, lon_start) for _, _, lat_start, lon_start in pack_tiles]
+        overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins)
+        if overview_tile:
+            entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
+        write_tile_pack(pack_path, entries)
+        pack_count += 1
+
+    return ref_time_iso, count, pack_count
+
 def generate_tiles(grib_path, forecast_hour, job_type, config):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
-        ds = ds.assign_coords(longitude=(((ds.longitude + 180) % 360) - 180)).sortby('longitude')
-        ref_time_iso = str(ds.time.values)
-        print(f"   ✂️ Tiling {job_type}...")
-
-        # --- FOLDER MANAGEMENT ---
-        # Create a specific subfolder for this data type (e.g. public/data/wind)
-        job_dir = os.path.join(OUTPUT_DIR, job_type)
-        os.makedirs(job_dir, exist_ok=True)
-
-        count = 0
-        pack_entries = {}
-        for lat_start in range(-90, 90, TILE_SIZE):
-            for lon_start in range(-180, 180, TILE_SIZE):
-                
-                lat_end = min(lat_start + TILE_SIZE, 90)
-                lon_end = min(lon_start + TILE_SIZE, 180)
-
-                subset = ds.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end))
-                if subset.latitude.size == 0 or subset.longitude.size == 0: continue
-
-                filename = tile_filename(job_type, forecast_hour, lat_start, lon_start)
-
-                lat_vals = subset.latitude.values
-                lon_vals = subset.longitude.values
-                dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
-                dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
-
-                components = make_components(subset, config, job_type)
-                if not components: continue
-
-                tile_path = os.path.join(job_dir, filename)
-                write_binary_tile(tile_path, lon_vals, lat_vals, dx, dy, components)
-                pack_start = pack_origin(lat_start, lon_start)
-                pack_entries.setdefault(pack_start, []).append(
-                    (tile_key(lat_start, lon_start), tile_path, lat_start, lon_start)
-                )
-                count += 1
-
-        pack_count = 0
-        for (pack_lat_start, pack_lon_start), pack_tiles in pack_entries.items():
-            pack_path = os.path.join(
-                job_dir,
-                pack_filename(job_type, forecast_hour, pack_lat_start, pack_lon_start)
-            )
-            entries = [(key, tile_path) for key, tile_path, _, _ in pack_tiles]
-            tile_origins = [(lat_start, lon_start) for _, _, lat_start, lon_start in pack_tiles]
-            overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins)
-            if overview_tile:
-                entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
-            write_tile_pack(pack_path, entries)
-            pack_count += 1
-
+        ds = normalize_dataset_coordinates(ds)
+        ref_time_iso, count, pack_count = generate_tiles_from_dataset(ds, forecast_hour, job_type, config)
         ds.close()
         return True, ref_time_iso, count, pack_count
 
@@ -413,8 +464,109 @@ def generate_tiles(grib_path, forecast_hour, job_type, config):
         print(f"❌ Error tiling {job_type}: {e}")
         return False, None, 0, 0
 
+def gfs_filter_request(date, run_hour, forecast_hour, vars_config, level_config):
+    f_str = f"{forecast_hour:03d}"
+    server_file = f"gfs.t{run_hour}z.pgrb2.0p25.f{f_str}"
+    dir_path = f"/gfs.{date}/{run_hour}/atmos"
+    params = {
+        'file': server_file,
+        'dir': dir_path,
+        'leftlon': '0',
+        'rightlon': '360',
+        'toplat': '90',
+        'bottomlat': '-90',
+        **vars_config,
+        **level_config
+    }
+    return "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl", params
+
+def gfs_atmos_base_url(date, run_hour, forecast_hour):
+    f_str = f"{forecast_hour:03d}"
+    return (
+        f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
+        f"gfs.{date}/{run_hour}/atmos/gfs.t{run_hour}z.pgrb2.0p25.f{f_str}"
+    )
+
+def download_grib(url, params, output_path):
+    response = requests.get(url, params=params, stream=True, timeout=180)
+    if response.status_code != 200:
+        print(f"⚠️ NOAA Error {response.status_code}")
+        return False
+
+    with open(output_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=16384):
+            f.write(chunk)
+    return True
+
+def first_data_array(ds):
+    data_vars = list(ds.data_vars)
+    if not data_vars:
+        raise ValueError("No data variables found")
+    return ds[data_vars[0]]
+
+def storm_potential_index(cape, composite_reflectivity):
+    cape_score = ((cape - 250.0) / 1750.0).clip(0.0, 1.0)
+    reflectivity_score = ((composite_reflectivity - 20.0) / 35.0).clip(0.0, 1.0)
+
+    # CAPE identifies unstable air, while composite reflectivity anchors the signal
+    # to model-predicted convection. The overlap term keeps broad unstable air from
+    # becoming a blanket high-risk layer by itself.
+    overlap_score = np.sqrt(cape_score) * np.power(reflectivity_score, 0.7)
+    index = (0.35 * cape_score) + (0.65 * overlap_score)
+    return index.clip(0.0, 1.0)
+
+def download_and_process_storm_potential(job_type, date, run_hour, forecast_hour, config):
+    source_paths = {}
+    source_datasets = []
+    f_str = f"{forecast_hour:03d}"
+
+    try:
+        base_url = gfs_atmos_base_url(date, run_hour, forecast_hour)
+        for source_name, source_config in config["sources"].items():
+            path = os.path.join(OUTPUT_DIR, f"temp_{job_type}_{source_name}_{forecast_hour}.grib2")
+            print(f"⬇️ {job_type.upper()} {source_name} f{f_str}...")
+            if not download_idx_message(base_url, source_config["idx_match"], path):
+                return None, 0, 0
+            source_paths[source_name] = path
+
+        cape_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["cape"], engine='cfgrib'))
+        refc_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["composite_reflectivity"], engine='cfgrib'))
+        source_datasets.extend([cape_ds, refc_ds])
+
+        cape, refc = xr.align(first_data_array(cape_ds), first_data_array(refc_ds), join="inner")
+        storm_score = storm_potential_index(cape.astype(np.float32), refc.astype(np.float32))
+        if config["grid_type"] == "vector":
+            wind_u_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["wind_u"], engine='cfgrib'))
+            wind_v_ds = normalize_dataset_coordinates(xr.open_dataset(source_paths["wind_v"], engine='cfgrib'))
+            source_datasets.extend([wind_u_ds, wind_v_ds])
+
+            storm_score, wind_u, wind_v = xr.align(
+                storm_score,
+                first_data_array(wind_u_ds),
+                first_data_array(wind_v_ds),
+                join="inner"
+            )
+            storm_ds = xr.Dataset({
+                "u_storm_motion": wind_u.astype(np.float32) * storm_score,
+                "v_storm_motion": wind_v.astype(np.float32) * storm_score
+            })
+        else:
+            storm_ds = (storm_score * 100.0).to_dataset(name="storm_potential")
+
+        ref_time, count, pack_count = generate_tiles_from_dataset(storm_ds, forecast_hour, job_type, config)
+        return ref_time, count, pack_count
+    except Exception as e:
+        print(f"❌ Error generating {job_type}: {e}")
+        return None, 0, 0
+    finally:
+        for ds in source_datasets:
+            ds.close()
+        for path in source_paths.values():
+            if os.path.exists(path):
+                os.remove(path)
+
 def download_and_process(job_type, date, run_hour, forecast_hour):
-    if job_type not in NOAA_CONFIG: return None, 0
+    if job_type not in NOAA_CONFIG: return None, 0, 0
     conf = NOAA_CONFIG[job_type]
     f_str = f"{forecast_hour:03d}"
     
@@ -423,6 +575,8 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
     
     if conf['type'] == 'direct_download':
         url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date}/{run_hour}/wave/gridded/gfswave.t{run_hour}z.global.0p25.f{f_str}.grib2"
+    elif conf['type'] == 'derived_storm_potential':
+        return download_and_process_storm_potential(job_type, date, run_hour, forecast_hour, conf)
     elif conf['type'] == 'gefs_chem_idx':
         url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.{date}/{run_hour}/chem/pgrb2ap25/gefs.chem.t{run_hour}z.a2d_0p25.f{f_str}.grib2"
     elif conf['type'] == 'gefs_aero':
@@ -431,10 +585,7 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
         dir_path = f"/gefs.{date}/{run_hour}/chem/pgrb2a.0p50"
         params = {'file': server_file, 'dir': dir_path, 'leftlon': '0', 'rightlon': '360', 'toplat': '90', 'bottomlat': '-90', **conf['vars'], **conf['level']}
     else:
-        url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
-        server_file = f"gfs.t{run_hour}z.pgrb2.0p25.f{f_str}"
-        dir_path = f"/gfs.{date}/{run_hour}/atmos"
-        params = {'file': server_file, 'dir': dir_path, 'leftlon': '0', 'rightlon': '360', 'toplat': '90', 'bottomlat': '-90', **conf['vars'], **conf['level']}
+        url, params = gfs_filter_request(date, run_hour, forecast_hour, conf['vars'], conf['level'])
 
     grib_path = os.path.join(OUTPUT_DIR, f"temp_{job_type}_{forecast_hour}.grib2")
 
@@ -492,7 +643,7 @@ if __name__ == "__main__":
             time.sleep(1)
         
         if job_ref_time:
-            manifest_updates[job] = {
+            manifest_entry = {
                 "ref_time": job_ref_time,
                 "tiles": total_tiles,
                 "packs": total_packs,
@@ -500,6 +651,9 @@ if __name__ == "__main__":
                 "tile_format": TILE_FORMAT,
                 "pack_format": PACK_FORMAT
             }
+            if "metadata" in NOAA_CONFIG[job]:
+                manifest_entry["metadata"] = NOAA_CONFIG[job]["metadata"]
+            manifest_updates[job] = manifest_entry
 
     if manifest_updates:
         print("\n✅ Batch Complete.")
