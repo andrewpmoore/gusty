@@ -23,7 +23,14 @@ USER_AGENT = os.getenv(
 )
 
 NOAA_ALERTS_URL = "https://api.weather.gov/alerts/active"
+CANADA_ALERTS_URL = "https://api.weather.gc.ca/collections/weather-alerts/items?f=json&lang=en&limit=10000"
 GDACS_RSS_URL = "https://www.gdacs.org/xml/rss.xml"
+HKO_WARN_SUM_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warnsum&lang=en"
+HKO_WARNING_INFO_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=warningInfo&lang=en"
+SINGAPORE_TWO_HR_FORECAST_URL = "https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast"
+JMA_WARNINGS_URL = "https://www.jma.go.jp/bosai/warning/data/warning/map.json"
+JMA_AREA_URL = "https://www.jma.go.jp/bosai/common/const/area.json"
+USGS_EARTHQUAKES_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_week.geojson"
 NHC_KML_URLS = [
     "https://www.nhc.noaa.gov/gis/kml/nhc.kmz",
     "https://www.nhc.noaa.gov/gis/kml/nhc_active.kml",
@@ -185,6 +192,14 @@ def active_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return active
 
 
+def is_recent(value: Any, max_age: dt.timedelta) -> bool:
+    parsed = parse_datetime(value)
+    if not parsed:
+        return True
+    current = dt.datetime.now(dt.timezone.utc)
+    return parsed >= current - max_age
+
+
 def compact_text(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -205,11 +220,15 @@ def severity(value: Any) -> str:
         return "moderate"
     if normalized in {"red", "high"}:
         return "severe"
+    if normalized in {"extreme", "exceptional"}:
+        return "extreme"
     return "unknown"
 
 
 def categorize_event(event: Any) -> str:
     text = (compact_text(event) or "").lower()
+    if any(token in text for token in ["earthquake", "quake", "seismic"]):
+        return "earthquake"
     if any(token in text for token in ["hurricane", "typhoon", "cyclone", "tropical storm"]):
         return "tropical"
     if any(token in text for token in ["fire", "wildfire", "forest fire"]):
@@ -434,6 +453,81 @@ def first_element_text(parent: ET.Element, paths: Iterable[str]) -> Optional[str
     return None
 
 
+def canada_severity(props: Dict[str, Any]) -> str:
+    text = f"{props.get('alert_type', '')} {props.get('alert_name_en', '')}".lower()
+    if "warning" in text:
+        return "severe"
+    if "watch" in text:
+        return "moderate"
+    if "advisory" in text or "statement" in text:
+        return "minor"
+    return "unknown"
+
+
+def usgs_severity(magnitude: Any) -> str:
+    try:
+        mag = float(magnitude)
+    except (TypeError, ValueError):
+        return "unknown"
+    if mag >= 7.0:
+        return "extreme"
+    if mag >= 6.0:
+        return "severe"
+    if mag >= 5.0:
+        return "moderate"
+    return "minor"
+
+
+def jma_warning_name(code: Any) -> str:
+    names = {
+        "02": "Storm surge warning",
+        "03": "Heavy rain warning",
+        "04": "Flood warning",
+        "05": "Storm warning",
+        "06": "Heavy snow warning",
+        "07": "High waves warning",
+        "10": "Heavy rain advisory",
+        "12": "Heavy snow advisory",
+        "13": "Gale advisory",
+        "14": "Thunderstorm advisory",
+        "15": "Dense fog advisory",
+        "16": "Dry air advisory",
+        "17": "Avalanche advisory",
+        "18": "Snow accretion advisory",
+        "19": "Frost advisory",
+        "20": "Low temperature advisory",
+        "21": "Meltwater advisory",
+        "22": "Flood advisory",
+        "23": "Storm surge advisory",
+        "24": "High waves advisory",
+        "32": "Storm surge emergency warning",
+        "33": "Heavy rain emergency warning",
+        "35": "Storm emergency warning",
+        "36": "Heavy snow emergency warning",
+        "37": "High waves emergency warning",
+    }
+    return names.get(str(code), f"JMA warning code {code}")
+
+
+def jma_severity(code: Any) -> str:
+    text = str(code)
+    if text.startswith("3"):
+        return "extreme"
+    if text in {"02", "03", "04", "05", "06", "07"}:
+        return "severe"
+    if text.startswith("1") or text.startswith("2"):
+        return "moderate"
+    return "unknown"
+
+
+def jma_area_lookup(area_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup = {}
+    for group_name in ["centers", "offices", "class10s", "class15s", "class20s"]:
+        for code, data in area_payload.get(group_name, {}).items():
+            lookup[code] = data
+    return lookup
+
+
 def fetch_noaa_alerts(client: requests.Session) -> ProviderResult:
     provider = "NOAA_NWS"
     try:
@@ -472,6 +566,231 @@ def fetch_noaa_alerts(client: requests.Session) -> ProviderResult:
         return ProviderResult(provider, features, source_url=NOAA_ALERTS_URL)
     except Exception as exc:
         return ProviderResult(provider, status="error", error=str(exc), source_url=NOAA_ALERTS_URL)
+
+
+def fetch_canada_alerts(client: requests.Session) -> ProviderResult:
+    provider = "CANADA_MSC"
+    try:
+        response = client.get(CANADA_ALERTS_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        features = []
+        for raw in payload.get("features", []):
+            props = raw.get("properties", {})
+            alert_name = props.get("alert_name_en") or props.get("alert_name_fr")
+            features.append(
+                make_feature(
+                    provider,
+                    raw.get("geometry"),
+                    {
+                        "id": props.get("id") or raw.get("id"),
+                        "sourceUrl": CANADA_ALERTS_URL,
+                        "event": alert_name,
+                        "severity": canada_severity(props),
+                        "status": props.get("alert_type"),
+                        "headline": alert_name,
+                        "description": props.get("alert_text_en") or props.get("alert_text_fr"),
+                        "areaName": props.get("alert_area_name_en") or props.get("alert_area_name_fr"),
+                        "country": "CA",
+                        "effective": props.get("validity_datetime"),
+                        "onset": props.get("validity_datetime"),
+                        "expires": props.get("expiration_datetime"),
+                        "updated": props.get("publication_datetime"),
+                        "attribution": "Environment and Climate Change Canada / MSC GeoMet",
+                    },
+                )
+            )
+        return ProviderResult(provider, features, source_url=CANADA_ALERTS_URL)
+    except Exception as exc:
+        return ProviderResult(provider, status="error", error=str(exc), source_url=CANADA_ALERTS_URL)
+
+
+def fetch_hko_alerts(client: requests.Session) -> ProviderResult:
+    provider = "HKO"
+    try:
+        warnsum = client.get(HKO_WARN_SUM_URL, timeout=TIMEOUT)
+        warnsum.raise_for_status()
+        warning_info = client.get(HKO_WARNING_INFO_URL, timeout=TIMEOUT)
+        warning_info.raise_for_status()
+        summary_payload = warnsum.json()
+        detail_payload = warning_info.json()
+
+        details = {}
+        for item in detail_payload.get("details", []) if isinstance(detail_payload, dict) else []:
+            code = item.get("warningStatementCode") or item.get("subtype") or item.get("code")
+            if code:
+                details[str(code)] = item
+
+        features = []
+        if isinstance(summary_payload, dict):
+            for key, value in summary_payload.items():
+                if not isinstance(value, dict):
+                    continue
+                detail = details.get(str(value.get("code") or key), {})
+                name = value.get("name") or detail.get("contents") or key
+                action = value.get("actionCode") or value.get("type")
+                features.append(
+                    make_feature(
+                        provider,
+                        None,
+                        {
+                            "id": f"HKO:{key}:{value.get('issueTime') or value.get('updateTime')}",
+                            "sourceUrl": HKO_WARN_SUM_URL,
+                            "event": name,
+                            "severity": "severe" if str(action).upper() in {"ISSUE", "REISSUE"} else "moderate",
+                            "status": action,
+                            "headline": name,
+                            "description": detail.get("contents") or name,
+                            "areaName": "Hong Kong",
+                            "country": "HK",
+                            "effective": value.get("issueTime"),
+                            "expires": value.get("expireTime"),
+                            "updated": value.get("updateTime") or value.get("issueTime"),
+                            "attribution": "Hong Kong Observatory",
+                        },
+                    )
+                )
+        return ProviderResult(provider, features, source_url=HKO_WARN_SUM_URL)
+    except Exception as exc:
+        return ProviderResult(provider, status="error", error=str(exc), source_url=HKO_WARN_SUM_URL)
+
+
+def fetch_singapore_forecast(client: requests.Session) -> ProviderResult:
+    provider = "DATA_GOV_SG"
+    try:
+        response = client.get(SINGAPORE_TWO_HR_FORECAST_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        payload = response.json().get("data", {})
+        metadata = {
+            item.get("name"): item.get("label_location", {})
+            for item in payload.get("area_metadata", [])
+        }
+        valid_period = payload.get("valid_period", {})
+        updated = payload.get("updated_timestamp")
+        features = []
+        for item in payload.get("items", []):
+            for forecast in item.get("forecasts", []):
+                area = forecast.get("area")
+                text = forecast.get("forecast")
+                location = metadata.get(area, {})
+                geometry = None
+                if "longitude" in location and "latitude" in location:
+                    geometry = {
+                        "type": "Point",
+                        "coordinates": [location["longitude"], location["latitude"]],
+                    }
+                features.append(
+                    make_feature(
+                        provider,
+                        geometry,
+                        {
+                            "id": f"SG:{area}:{item.get('update_timestamp') or updated}",
+                            "sourceUrl": SINGAPORE_TWO_HR_FORECAST_URL,
+                            "event": text,
+                            "severity": "minor" if text and any(word in text.lower() for word in ["thunder", "showers", "rain"]) else "unknown",
+                            "headline": f"{area}: {text}",
+                            "description": f"Two-hour forecast for {area}: {text}",
+                            "areaName": area,
+                            "country": "SG",
+                            "effective": valid_period.get("start"),
+                            "expires": valid_period.get("end"),
+                            "updated": item.get("update_timestamp") or updated,
+                            "layer": "regional_forecast",
+                            "attribution": "data.gov.sg / Meteorological Service Singapore",
+                        },
+                    )
+                )
+        return ProviderResult(provider, features, source_url=SINGAPORE_TWO_HR_FORECAST_URL)
+    except Exception as exc:
+        return ProviderResult(provider, status="error", error=str(exc), source_url=SINGAPORE_TWO_HR_FORECAST_URL)
+
+
+def fetch_jma_warnings(client: requests.Session) -> ProviderResult:
+    provider = "JMA"
+    try:
+        warnings = client.get(JMA_WARNINGS_URL, timeout=TIMEOUT)
+        warnings.raise_for_status()
+        areas = client.get(JMA_AREA_URL, timeout=TIMEOUT)
+        areas.raise_for_status()
+        area_lookup = jma_area_lookup(areas.json())
+        features = []
+        for report in warnings.json():
+            report_time = report.get("reportDatetime")
+            if not is_recent(report_time, dt.timedelta(hours=72)):
+                continue
+            for area_type in report.get("areaTypes", []):
+                for area in area_type.get("areas", []):
+                    code = str(area.get("code"))
+                    area_info = area_lookup.get(code, {})
+                    area_name = area_info.get("enName") or area_info.get("name") or code
+                    for warning in area.get("warnings", []):
+                        status = warning.get("status")
+                        if status in {"解除", "発表警報・注意報はなし"}:
+                            continue
+                        warning_code = warning.get("code")
+                        event = jma_warning_name(warning_code)
+                        features.append(
+                            make_feature(
+                                provider,
+                                None,
+                                {
+                                    "id": f"JMA:{code}:{warning_code}:{report_time}",
+                                    "sourceUrl": JMA_WARNINGS_URL,
+                                    "event": event,
+                                    "severity": jma_severity(warning_code),
+                                    "status": status,
+                                    "headline": f"{event} for {area_name}",
+                                    "description": f"{event}; JMA status: {status}; area code: {code}",
+                                    "areaName": area_name,
+                                    "country": "JP",
+                                    "region": area_info.get("officeName"),
+                                    "updated": report_time,
+                                    "attribution": "Japan Meteorological Agency",
+                                },
+                            )
+                        )
+        return ProviderResult(provider, features, source_url=JMA_WARNINGS_URL)
+    except Exception as exc:
+        return ProviderResult(provider, status="error", error=str(exc), source_url=JMA_WARNINGS_URL)
+
+
+def fetch_usgs_earthquakes(client: requests.Session) -> ProviderResult:
+    provider = "USGS_EARTHQUAKES"
+    try:
+        response = client.get(USGS_EARTHQUAKES_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        features = []
+        for raw in payload.get("features", []):
+            props = raw.get("properties", {})
+            magnitude = props.get("mag")
+            event_time = None
+            if props.get("time"):
+                event_time = dt.datetime.fromtimestamp(props["time"] / 1000, tz=dt.timezone.utc).isoformat()
+            features.append(
+                make_feature(
+                    provider,
+                    raw.get("geometry"),
+                    {
+                        "id": raw.get("id"),
+                        "sourceUrl": props.get("url") or USGS_EARTHQUAKES_URL,
+                        "event": "Earthquake",
+                        "category": "earthquake",
+                        "severity": usgs_severity(magnitude),
+                        "headline": props.get("title"),
+                        "description": f"Magnitude {magnitude}; place: {props.get('place')}",
+                        "areaName": props.get("place"),
+                        "effective": event_time,
+                        "onset": event_time,
+                        "updated": event_time,
+                        "layer": "earthquakes",
+                        "attribution": "U.S. Geological Survey",
+                    },
+                )
+            )
+        return ProviderResult(provider, features, source_url=USGS_EARTHQUAKES_URL)
+    except Exception as exc:
+        return ProviderResult(provider, status="error", error=str(exc), source_url=USGS_EARTHQUAKES_URL)
 
 
 def meteoalarm_feeds() -> List[str]:
@@ -786,6 +1105,56 @@ def raster_layers() -> Dict[str, Any]:
                 "registration_required": False,
             },
             {
+                "id": "canada_msc_alerts",
+                "name": "Environment Canada Weather Alerts",
+                "type": "ogc-api-features",
+                "coverage": "Canada",
+                "url": CANADA_ALERTS_URL,
+                "free": True,
+                "registration_required": False,
+                "notes": "Normalized into hazards/alerts.geojson by provider CANADA_MSC.",
+            },
+            {
+                "id": "hko_open_data",
+                "name": "Hong Kong Observatory Open Data",
+                "type": "json/api",
+                "coverage": "Hong Kong",
+                "url": HKO_WARN_SUM_URL,
+                "free": True,
+                "registration_required": False,
+                "notes": "Warnings are normalized when active; warning endpoints can return an empty object during quiet periods.",
+            },
+            {
+                "id": "singapore_data_gov_forecast",
+                "name": "Singapore Two-hour Forecast",
+                "type": "json/api",
+                "coverage": "Singapore",
+                "url": SINGAPORE_TWO_HR_FORECAST_URL,
+                "free": True,
+                "registration_required": False,
+                "notes": "This is a forecast layer, not an official severe-warning feed.",
+            },
+            {
+                "id": "jma_warnings",
+                "name": "Japan Meteorological Agency Warnings",
+                "type": "json/api",
+                "coverage": "Japan",
+                "url": JMA_WARNINGS_URL,
+                "free": True,
+                "registration_required": False,
+                "notes": "Normalized without polygons because the public warning feed provides area codes and names.",
+            },
+            {
+                "id": "usgs_significant_earthquakes",
+                "name": "USGS Significant Earthquakes",
+                "type": "geojson",
+                "coverage": "Global",
+                "url": USGS_EARTHQUAKES_URL,
+                "free": True,
+                "registration_required": False,
+                "notes": "Normalized into hazards/earthquakes.geojson.",
+            },
+            {
                 "id": "nasa_firms",
                 "name": "NASA FIRMS Active Fires",
                 "type": "csv/api",
@@ -804,6 +1173,76 @@ def raster_layers() -> Dict[str, Any]:
                 "free": True,
                 "registration_required": False,
             },
+            {
+                "id": "optional_bom_australia",
+                "name": "Bureau of Meteorology Australia Warnings",
+                "type": "optional-geojson",
+                "coverage": "Australia",
+                "url_env": "BOM_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when a stable official or approved GeoJSON warning source is selected.",
+            },
+            {
+                "id": "optional_brazil_inmet",
+                "name": "Brazil INMET Alert-AS",
+                "type": "optional-geojson",
+                "coverage": "Brazil",
+                "url_env": "BRAZIL_INMET_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when a stable Alert-AS GeoJSON/CAP conversion endpoint is selected.",
+            },
+            {
+                "id": "optional_argentina_smn",
+                "name": "Argentina Servicio Meteorologico Nacional Alerts",
+                "type": "optional-geojson",
+                "coverage": "Argentina",
+                "url_env": "ARGENTINA_SMN_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when a stable official alerts endpoint is selected.",
+            },
+            {
+                "id": "optional_india_imd",
+                "name": "India Meteorological Department Alerts",
+                "type": "optional-geojson",
+                "coverage": "India and North Indian Ocean products",
+                "url_env": "INDIA_IMD_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when an official or approved machine-readable feed is selected.",
+            },
+            {
+                "id": "optional_pagasa",
+                "name": "DOST-PAGASA Alerts",
+                "type": "optional-geojson",
+                "coverage": "Philippines",
+                "url_env": "PAGASA_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when an official or approved machine-readable feed is selected.",
+            },
+            {
+                "id": "optional_fiji_rsmc_nadi",
+                "name": "Fiji Meteorological Service / RSMC Nadi",
+                "type": "optional-geojson",
+                "coverage": "South Pacific tropical cyclone products",
+                "url_env": "FIJI_RSMC_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when an official or approved machine-readable feed is selected.",
+            },
+            {
+                "id": "optional_jtwc",
+                "name": "Joint Typhoon Warning Center",
+                "type": "optional-geojson",
+                "coverage": "Western Pacific, Indian Ocean, and Southern Hemisphere tropical cyclone products",
+                "url_env": "JTWC_ALERTS_GEOJSON_URL",
+                "free": True,
+                "registration_required": False,
+                "notes": "Set this when an approved GeoJSON/KML conversion source is selected.",
+            },
         ],
     }
 
@@ -813,6 +1252,7 @@ def partition_outputs(results: List[ProviderResult]) -> Dict[str, List[Dict[str,
     tropical = []
     fires = []
     floods = []
+    earthquakes = []
 
     for result in results:
         for feature in result.features:
@@ -823,6 +1263,8 @@ def partition_outputs(results: List[ProviderResult]) -> Dict[str, List[Dict[str,
                 fires.append(feature)
             elif category == "flood":
                 floods.append(feature)
+            elif category == "earthquake":
+                earthquakes.append(feature)
             else:
                 alerts.append(feature)
 
@@ -831,6 +1273,7 @@ def partition_outputs(results: List[ProviderResult]) -> Dict[str, List[Dict[str,
         "tropical.geojson": tropical,
         "fires.geojson": fires,
         "floods.geojson": floods,
+        "earthquakes.geojson": earthquakes,
     }
 
 
@@ -883,15 +1326,56 @@ def run(previous_dir: Optional[str]) -> Dict[str, Any]:
 
     results = [
         fetch_noaa_alerts(client),
+        fetch_canada_alerts(client),
         fetch_meteoalarm(client),
+        fetch_hko_alerts(client),
+        fetch_singapore_forecast(client),
+        fetch_jma_warnings(client),
         fetch_gdacs(client),
         fetch_nhc(client),
+        fetch_usgs_earthquakes(client),
         fetch_firms(client),
         fetch_optional_geojson_provider(
             client,
-            "CANADA_MSC_ALERTS",
-            "CANADA_MSC_ALERTS_GEOJSON_URL",
-            "Environment and Climate Change Canada / MSC GeoMet",
+            "BOM_AUSTRALIA",
+            "BOM_ALERTS_GEOJSON_URL",
+            "Australian Bureau of Meteorology",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "BRAZIL_INMET",
+            "BRAZIL_INMET_ALERTS_GEOJSON_URL",
+            "Instituto Nacional de Meteorologia / Alert-AS",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "ARGENTINA_SMN",
+            "ARGENTINA_SMN_ALERTS_GEOJSON_URL",
+            "Servicio Meteorologico Nacional Argentina",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "INDIA_IMD",
+            "INDIA_IMD_ALERTS_GEOJSON_URL",
+            "India Meteorological Department",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "PAGASA",
+            "PAGASA_ALERTS_GEOJSON_URL",
+            "DOST-PAGASA",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "FIJI_RSMC_NADI",
+            "FIJI_RSMC_ALERTS_GEOJSON_URL",
+            "Fiji Meteorological Service / RSMC Nadi",
+        ),
+        fetch_optional_geojson_provider(
+            client,
+            "JTWC",
+            "JTWC_ALERTS_GEOJSON_URL",
+            "Joint Typhoon Warning Center",
         ),
     ]
 
@@ -899,7 +1383,7 @@ def run(previous_dir: Optional[str]) -> Dict[str, Any]:
     failed_providers = [
         result.provider
         for result in results
-        if result.status in {"error", "skipped"} and result.provider != "NASA_FIRMS"
+        if result.status == "error"
     ]
 
     for name, features in outputs.items():

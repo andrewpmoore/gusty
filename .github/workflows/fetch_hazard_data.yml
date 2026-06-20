@@ -43,7 +43,13 @@ jobs:
           GUSTY_USER_AGENT: "GustyWeather/1.0 (https://gustyweather.com; weather-data-ingestion)"
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
           METEOALARM_FEEDS: ${{ vars.METEOALARM_FEEDS }}
-          CANADA_MSC_ALERTS_GEOJSON_URL: ${{ vars.CANADA_MSC_ALERTS_GEOJSON_URL }}
+          BOM_ALERTS_GEOJSON_URL: ${{ vars.BOM_ALERTS_GEOJSON_URL }}
+          BRAZIL_INMET_ALERTS_GEOJSON_URL: ${{ vars.BRAZIL_INMET_ALERTS_GEOJSON_URL }}
+          ARGENTINA_SMN_ALERTS_GEOJSON_URL: ${{ vars.ARGENTINA_SMN_ALERTS_GEOJSON_URL }}
+          INDIA_IMD_ALERTS_GEOJSON_URL: ${{ vars.INDIA_IMD_ALERTS_GEOJSON_URL }}
+          PAGASA_ALERTS_GEOJSON_URL: ${{ vars.PAGASA_ALERTS_GEOJSON_URL }}
+          FIJI_RSMC_ALERTS_GEOJSON_URL: ${{ vars.FIJI_RSMC_ALERTS_GEOJSON_URL }}
+          JTWC_ALERTS_GEOJSON_URL: ${{ vars.JTWC_ALERTS_GEOJSON_URL }}
         run: python fetch_hazard_data.py --previous-dir previous_data --print-summary
 
       - name: Deploy Hazard Data
