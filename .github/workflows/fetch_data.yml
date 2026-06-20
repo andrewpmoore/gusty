@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: gusty-data-deploy
+  cancel-in-progress: false
+
 jobs:
   update-weather:
     runs-on: ubuntu-latest

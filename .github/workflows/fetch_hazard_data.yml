@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: gusty-data-deploy
+  cancel-in-progress: false
+
 jobs:
   update-hazards:
     runs-on: ubuntu-latest
@@ -46,7 +50,8 @@ jobs:
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
         run: |
-          rm -rf previous_data/.git
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" latest_data || true
+          rm -rf latest_data/.git
           mkdir deploy_staging
           cd deploy_staging
           git init
@@ -54,13 +59,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if [ -d "../previous_data" ]; then
-            cp -a ../previous_data/. .
+          if [ -d "../latest_data" ]; then
+            cp -a ../latest_data/. .
           else
             echo "Init" > init.txt
           fi
 
-          cp -a ../public/data/. .
+          rm -rf hazards layers
+          cp -a ../public/data/hazards ./hazards
+          cp -a ../public/data/layers ./layers
           git add .
           git commit --allow-empty -m "Latest Hazard Data: $(date -u)"
           git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force
