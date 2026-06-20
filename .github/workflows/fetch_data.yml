@@ -81,5 +81,13 @@ jobs:
           # ADDED --allow-empty HERE to prevent crashing when data is identical
           git commit --allow-empty -m "Latest Weather Data: $(date -u)"
           
-          # 6. Force Push
-          git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force
+          # 6. Force Push with retry for transient remote ref lock races
+          for attempt in 1 2 3; do
+            if git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep 10
+          done
