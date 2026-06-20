@@ -1,0 +1,66 @@
+name: Fetch Hazard Data
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-hazards:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Libraries
+        run: pip install requests
+
+      - name: Download Previous Data
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" previous_data || true
+
+      - name: Fetch Hazard Layers
+        env:
+          GUSTY_PREVIOUS_DATA_DIR: previous_data
+          GUSTY_USER_AGENT: "GustyWeather/1.0 (https://gustyweather.com; weather-data-ingestion)"
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+          METEOALARM_FEEDS: ${{ vars.METEOALARM_FEEDS }}
+          CANADA_MSC_ALERTS_GEOJSON_URL: ${{ vars.CANADA_MSC_ALERTS_GEOJSON_URL }}
+        run: python fetch_hazard_data.py --previous-dir previous_data --print-summary
+
+      - name: Deploy Hazard Data
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+        run: |
+          rm -rf previous_data/.git
+          mkdir deploy_staging
+          cd deploy_staging
+          git init
+          git branch -M main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -d "../previous_data" ]; then
+            cp -a ../previous_data/. .
+          else
+            echo "Init" > init.txt
+          fi
+
+          cp -a ../public/data/. .
+          git add .
+          git commit --allow-empty -m "Latest Hazard Data: $(date -u)"
+          git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force
