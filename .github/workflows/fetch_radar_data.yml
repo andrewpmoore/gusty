@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'fetch_radar_data.py'
+      - 'radar_providers.example.json'
+      - 'requirements.txt'
+      - '.github/workflows/fetch_radar_data.yml'
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:

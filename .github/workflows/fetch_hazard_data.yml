@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'fetch_hazard_data.py'
+      - '.github/workflows/fetch_hazard_data.yml'
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:

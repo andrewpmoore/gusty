@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'fetch_weather_data.py'
+      - '.github/workflows/fetch_data.yml'
   schedule:
     - cron: '30 4,10,16,22 * * *'
   workflow_dispatch:
