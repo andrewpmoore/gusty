@@ -42,6 +42,12 @@ ECCC_RADAR_LAYER = "RADAR_1KM_RRAI"
 ECCC_RADAR_STYLE = "RADARURPPRECIPR14-LINEAR"
 JMA_NOWCAST_TIMES_URL = "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json"
 JMA_NOWCAST_TILE_TEMPLATE = "https://www.jma.go.jp/bosai/jmatile/data/nowc/{base_time}/none/{valid_time}/surf/hrpns/{z}/{x}/{y}.png"
+OPERA_CIRRUS_LIST_IMAGES_URL = "https://cdn.fmi.fi/demos/eumetnet-web-site-radar-animator/list-images/"
+OPERA_CIRRUS_ANIMATOR_URL = "https://www.eumetnet.eu/observations/opera-radar-animation/"
+OPERA_CIRRUS_PRODUCT_URL = "https://www.eumetnet.eu/wp-content/uploads/2024/06/OPERA_Max-Reflectivity_Product-Sheet_Ed-2.0.pdf"
+OPERA_NIMBUS_PRODUCT_URL = "https://www.eumetnet.eu/wp-content/uploads/2024/06/NIMBUS_datasheet_composites_1.0_13062024.pdf"
+OPERA_NIMBUS_RAIN_RATE_PREFIX = "T_PAAH22_C_EUOC_"
+OPERA_CIRRUS_REFLECTIVITY_PREFIX = "T_PABV21_C_EUOC_"
 
 CONFIGURABLE_RADAR_REGIONS = [
     {
@@ -59,6 +65,14 @@ CONFIGURABLE_RADAR_REGIONS = [
         "attribution": "Met Eireann / Met Office where applicable",
         "source_url": "https://www.met.ie/",
         "notes": "Configure an approved Met Eireann or Met Office image/WMS endpoint with a declared palette mapping.",
+    },
+    {
+        "id": "radar_europe_opera_cirrus",
+        "name": "Europe OPERA/CIRRUS Rain Rate",
+        "region": "Europe",
+        "attribution": "EUMETNET OPERA / Finnish Meteorological Institute",
+        "source_url": OPERA_CIRRUS_ANIMATOR_URL,
+        "notes": "Active public Europe layer. Replace with OPERA NIMBUS rain-rate raw products when a reachable ORD/EWC endpoint is available.",
     },
     {
         "id": "radar_canada_configured",
@@ -272,6 +286,7 @@ REGION_BOUNDS = {
     "Denmark": [7.8, 54.4, 15.3, 57.9],
     "El Salvador": [-90.2, 13.0, -87.7, 14.5],
     "Estonia": [21.5, 57.4, 28.3, 59.8],
+    "Europe": [-25.0, 34.0, 45.0, 72.0],
     "Fiji": [176.5, -20.8, 180.0, -12.0],
     "Finland": [19.0, 59.5, 31.8, 70.2],
     "France": [-5.3, 41.1, 9.8, 51.3],
@@ -342,6 +357,24 @@ PROVIDER_ENDPOINTS = {
         },
         "machine_readable": True,
         "endpoint_notes": "Active provider: MSC GeoMet WMS rain precipitation-rate layer converted from the official linear legend.",
+    },
+    "Europe": {
+        "endpoint_type": "timestamped-image-sequence",
+        "endpoint_url": OPERA_CIRRUS_LIST_IMAGES_URL,
+        "machine_readable": True,
+        "endpoint_notes": "Active provider: EUMETNET OPERA/CIRRUS public 5-minute maximum-reflectivity frame list decoded from the labelled dBZ palette.",
+        "preferred_raw_product": {
+            "name": "OPERA NIMBUS Instantaneous Rain Rate",
+            "prefix": OPERA_NIMBUS_RAIN_RATE_PREFIX,
+            "format": "ODIM HDF5 / Cloud-Optimized GeoTIFF",
+            "source_url": OPERA_NIMBUS_PRODUCT_URL,
+            "notes": "Use this product instead of CIRRUS when a reachable ORD/EWC rolling-cache URL is available; it is already rain rate and avoids reflectivity conversion.",
+        },
+        "reflectivity_product": {
+            "name": "OPERA CIRRUS Maximum Reflectivity",
+            "prefix": OPERA_CIRRUS_REFLECTIVITY_PREFIX,
+            "source_url": OPERA_CIRRUS_PRODUCT_URL,
+        },
     },
     "Germany": {
         "endpoint_type": "opendata-directory",
@@ -1164,6 +1197,20 @@ ECCC_RADAR_COLOR_RAMP = [
     (200.0, "#33004d"),
 ]
 
+OPERA_CIRRUS_DBZ_RAMP = [
+    (50.0, "#beffff"),
+    (45.0, "#fa78ff"),
+    (40.0, "#ff503c"),
+    (34.0, "#ff9632"),
+    (30.0, "#ffcd14"),
+    (24.0, "#f0f014"),
+    (18.0, "#8ce614"),
+    (12.0, "#05cdaa"),
+    (8.0, "#0ab9af"),
+    (0.0, "#0a9bb4"),
+    (-6.0, "#0a82c8"),
+]
+
 
 def rgba_to_color_ramp_values(image: Image.Image, ramp: List[Tuple[float, str]]) -> np.ndarray:
     rgba = np.array(image.convert("RGBA"), dtype=np.uint8)
@@ -1178,6 +1225,42 @@ def rgba_to_color_ramp_values(image: Image.Image, ramp: List[Tuple[float, str]])
     distances = np.sum((pixels[:, None, :] - colors[None, :, :]) ** 2, axis=2)
     output[mask] = values[np.argmin(distances, axis=1)]
     return np.where(output < RADAR_MIN_VALUE, 0.0, output).astype(np.float32)
+
+
+def rgba_to_threshold_ramp_values(
+    image: Image.Image,
+    ramp: List[Tuple[float, str]],
+    max_color_distance: int = 900,
+    exclude_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> np.ndarray:
+    rgba = np.array(image.convert("RGBA"), dtype=np.uint8)
+    output = np.zeros(rgba.shape[:2], dtype=np.float32)
+    mask = rgba[:, :, 3] > 0
+    if exclude_boxes:
+        for left, top, right, bottom in exclude_boxes:
+            mask[top:bottom, left:right] = False
+    if not np.any(mask):
+        return output
+
+    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int16)
+    values = np.array([value for value, _ in ramp], dtype=np.float32)
+    pixels = rgba[:, :, :3][mask].astype(np.int16)
+    distances = np.sum((pixels[:, None, :] - colors[None, :, :]) ** 2, axis=2)
+    closest = np.argmin(distances, axis=1)
+    accepted = distances[np.arange(len(closest)), closest] <= max_color_distance
+    mapped = np.zeros(len(closest), dtype=np.float32)
+    mapped[accepted] = values[closest[accepted]]
+    output[mask] = mapped
+    return output.astype(np.float32)
+
+
+def epoch_millis_to_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(value) / 1000.0, tz=dt.timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def eccc_radar_wms_url(bounds: Tuple[float, float, float, float]) -> str:
@@ -1224,6 +1307,55 @@ def fetch_canada_geomet_radar(client: requests.Session) -> RadarGrid:
         units="mm/h",
         source_units="mm/h",
         source_parameter=RADAR_VALUE_PARAMETER,
+    )
+
+
+def latest_opera_cirrus_frame(client: requests.Session) -> Tuple[str, Optional[str]]:
+    response = client.get(OPERA_CIRRUS_LIST_IMAGES_URL, timeout=TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    images = payload.get("images") or []
+    if not images:
+        raise ValueError("OPERA/CIRRUS frame list is empty")
+    latest = max(images, key=lambda item: item.get("epoch") or 0)
+    url = latest.get("url")
+    if not url:
+        raise ValueError("Latest OPERA/CIRRUS frame has no URL")
+    ref_time = epoch_millis_to_iso(latest.get("epoch")) or epoch_millis_to_iso(payload.get("lastModified"))
+    return url, ref_time
+
+
+def fetch_opera_cirrus_radar(client: requests.Session) -> RadarGrid:
+    bounds = REGION_BOUNDS["Europe"]
+    west, south, east, north = bounds
+    image_url, ref_time = latest_opera_cirrus_frame(client)
+    image_bytes, image_time = get_bytes(client, image_url)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        width, height = image.size
+        dbz = rgba_to_threshold_ramp_values(
+            image,
+            OPERA_CIRRUS_DBZ_RAMP,
+            exclude_boxes=[
+                (830, 0, width, 370),
+                (810, max(0, height - 130), width, height),
+            ],
+        )
+    rain_rate, source_units, source_parameter = standardize_values(dbz, "dBZ")
+    x_pixel_size = (east - west) / max(width - 1, 1)
+    y_pixel_size = (south - north) / max(height - 1, 1)
+    values, latitudes, longitudes = sample_grid(rain_rate, x_pixel_size, y_pixel_size, west, north)
+    return RadarGrid(
+        provider_id="radar_europe_opera_cirrus",
+        name="Europe OPERA/CIRRUS Rain Rate",
+        values=values,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        ref_time=ref_time or image_time,
+        source_url=OPERA_CIRRUS_ANIMATOR_URL,
+        attribution="EUMETNET OPERA / Finnish Meteorological Institute",
+        region="Europe",
+        source_units=source_units,
+        source_parameter=source_parameter,
     )
 
 
@@ -1635,6 +1767,8 @@ def layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "endpoint_url": result.get("endpoint_url"),
                 "endpoint_type": result.get("endpoint_type"),
                 "machine_readable": result.get("machine_readable"),
+                "preferred_raw_product": result.get("preferred_raw_product"),
+                "reflectivity_product": result.get("reflectivity_product"),
                 "metadata": result.get("metadata"),
                 "vector_tile_format": result.get("vector_tile_format"),
                 "vector_pack_format": result.get("vector_pack_format"),
@@ -1669,6 +1803,8 @@ def vector_layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, An
                 "attribution": result.get("attribution"),
                 "source_url": result.get("source_url"),
                 "provider_url": result.get("provider_url") or result.get("source_url"),
+                "preferred_raw_product": result.get("preferred_raw_product"),
+                "reflectivity_product": result.get("reflectivity_product"),
                 "vector_tile_format": result.get("vector_tile_format", VECTOR_TILE_FORMAT),
                 "vector_pack_format": result.get("vector_pack_format", VECTOR_PACK_FORMAT),
             }
@@ -1759,6 +1895,22 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             "Canada",
             ECCC_GEOMET_URL,
             "Environment and Climate Change Canada / MSC GeoMet",
+            exc,
+        )
+        results.append(result)
+        result_ids.add(result["id"])
+
+    try:
+        result = generate_tiles(fetch_opera_cirrus_radar(client))
+        results.append(result)
+        result_ids.add(result["id"])
+    except Exception as exc:
+        result = provider_error(
+            "radar_europe_opera_cirrus",
+            "Europe OPERA/CIRRUS Rain Rate",
+            "Europe",
+            OPERA_CIRRUS_ANIMATOR_URL,
+            "EUMETNET OPERA / Finnish Meteorological Institute",
             exc,
         )
         results.append(result)
