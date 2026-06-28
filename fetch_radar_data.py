@@ -31,6 +31,11 @@ IEM_N0Q_DOCS_URL = "https://mesonet.agron.iastate.edu/docs/nexrad_composites/"
 RAINVIEWER_SOURCES_URL = "https://www.rainviewer.com/sources.html"
 MET_OFFICE_PUBLIC_RADAR_URL = "https://www.metoffice.gov.uk/public/weather/observation/map/#?map=Rainfall"
 MET_OFFICE_DATAHUB_URL = "https://datahub.metoffice.gov.uk/"
+ECCC_GEOMET_URL = "https://geo.weather.gc.ca/geomet"
+ECCC_RADAR_LAYER = "RADAR_1KM_RRAI"
+ECCC_RADAR_STYLE = "RADARURPPRECIPR14-LINEAR"
+JMA_NOWCAST_TIMES_URL = "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json"
+JMA_NOWCAST_TILE_TEMPLATE = "https://www.jma.go.jp/bosai/jmatile/data/nowc/{base_time}/none/{valid_time}/surf/hrpns/{z}/{x}/{y}.png"
 
 CONFIGURABLE_RADAR_REGIONS = [
     {
@@ -319,16 +324,17 @@ REGION_BOUNDS = {
 PROVIDER_ENDPOINTS = {
     "Canada": {
         "endpoint_type": "wms",
-        "endpoint_url": "https://geo.weather.gc.ca/geomet",
+        "endpoint_url": ECCC_GEOMET_URL,
         "wms": {
-            "url": "https://geo.weather.gc.ca/geomet",
-            "layers": "RADAR_1KM_RRAI",
+            "url": ECCC_GEOMET_URL,
+            "layers": ECCC_RADAR_LAYER,
+            "styles": ECCC_RADAR_STYLE,
             "version": "1.3.0",
             "crs": "EPSG:4326",
             "format": "image/png",
         },
         "machine_readable": True,
-        "endpoint_notes": "MSC GeoMet WMS. Confirm exact radar layer and legend before activating numeric conversion.",
+        "endpoint_notes": "Active provider: MSC GeoMet WMS rain precipitation-rate layer converted from the official linear legend.",
     },
     "Germany": {
         "endpoint_type": "opendata-directory",
@@ -338,10 +344,10 @@ PROVIDER_ENDPOINTS = {
     },
     "Japan": {
         "endpoint_type": "xyz-tile-timeseries",
-        "endpoint_url": "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json",
-        "tile_url_template": "https://www.jma.go.jp/bosai/jmatile/data/nowc/{base_time}/none/{valid_time}/surf/hrpns/{z}/{x}/{y}.png",
+        "endpoint_url": JMA_NOWCAST_TIMES_URL,
+        "tile_url_template": JMA_NOWCAST_TILE_TEMPLATE,
         "machine_readable": True,
-        "endpoint_notes": "JMA nowcast tile feed. Needs tile stitching before conversion to Gusty packs.",
+        "endpoint_notes": "Active provider: JMA nowcast time feed and hrpns raster tiles are stitched into numeric Gusty packs.",
     },
     "Netherlands": {
         "endpoint_type": "open-data-api",
@@ -750,22 +756,27 @@ def normalize_hex_color(value: str) -> Tuple[int, int, int]:
     return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
 
 
-def rgb_to_configured_values(image_bytes: bytes, color_values: Dict[str, Any]) -> np.ndarray:
+def rgba_to_configured_values(image: Image.Image, color_values: Dict[str, Any]) -> np.ndarray:
     mapping = {
         normalize_hex_color(color): float(mapped_value)
         for color, mapped_value in color_values.items()
     }
-    with Image.open(io.BytesIO(image_bytes)) as image:
-        rgb = np.array(image.convert("RGB"), dtype=np.uint8)
-    output = np.zeros(rgb.shape[:2], dtype=np.float32)
+    rgba = np.array(image.convert("RGBA"), dtype=np.uint8)
+    output = np.zeros(rgba.shape[:2], dtype=np.float32)
     for color, mapped_value in mapping.items():
         mask = (
-            (rgb[:, :, 0] == color[0])
-            & (rgb[:, :, 1] == color[1])
-            & (rgb[:, :, 2] == color[2])
+            (rgba[:, :, 0] == color[0])
+            & (rgba[:, :, 1] == color[1])
+            & (rgba[:, :, 2] == color[2])
+            & (rgba[:, :, 3] > 0)
         )
         output[mask] = mapped_value
     return np.where(output < RADAR_MIN_VALUE, 0.0, output).astype(np.float32)
+
+
+def rgb_to_configured_values(image_bytes: bytes, color_values: Dict[str, Any]) -> np.ndarray:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        return rgba_to_configured_values(image, color_values)
 
 
 def image_to_palette_indices(image_bytes: bytes) -> np.ndarray:
@@ -813,6 +824,194 @@ def fetch_us_iem_nexrad(client: requests.Session) -> RadarGrid:
         source_url=IEM_N0Q_DOCS_URL,
         attribution="Iowa Environmental Mesonet / NOAA NEXRAD",
         region="United States",
+    )
+
+
+def lon_to_tile_x(lon: float, zoom: int) -> int:
+    return int(math.floor((lon + 180.0) / 360.0 * (2 ** zoom)))
+
+
+def lat_to_tile_y(lat: float, zoom: int) -> int:
+    lat_rad = math.radians(lat)
+    return int(
+        math.floor(
+            (1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi)
+            / 2.0
+            * (2 ** zoom)
+        )
+    )
+
+
+def tile_pixel_to_lonlat(x: int, y: int, zoom: int, size: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = float(2 ** zoom * size)
+    cols = np.arange(x * size, (x + 1) * size, dtype=np.float64) + 0.5
+    rows = np.arange(y * size, (y + 1) * size, dtype=np.float64) + 0.5
+    longitudes = cols / n * 360.0 - 180.0
+    mercator = math.pi * (1.0 - 2.0 * rows / n)
+    latitudes = np.degrees(np.arctan(np.sinh(mercator)))
+    return longitudes, latitudes
+
+
+def parse_jma_time(value: str) -> str:
+    parsed = dt.datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone.utc)
+    return parsed.isoformat()
+
+
+JMA_HRPNS_COLOR_VALUES = {
+    "#f2f2ff": 0.5,
+    "#a0d2ff": 3.0,
+    "#218cff": 7.5,
+    "#0041ff": 15.0,
+    "#faf500": 25.0,
+    "#ff9900": 40.0,
+    "#ff2800": 65.0,
+    "#b40068": 90.0,
+}
+
+ECCC_RADAR_COLOR_RAMP = [
+    (0.1, "#8cc7fe"),
+    (1.0, "#40aefe"),
+    (2.0, "#00e092"),
+    (4.0, "#00d615"),
+    (8.0, "#009d00"),
+    (12.0, "#006600"),
+    (16.0, "#fef800"),
+    (24.0, "#fec100"),
+    (32.0, "#fe8700"),
+    (50.0, "#fe3700"),
+    (64.0, "#fe0159"),
+    (100.0, "#ba23ba"),
+    (125.0, "#6e08a1"),
+    (200.0, "#33004d"),
+]
+
+
+def rgba_to_color_ramp_values(image: Image.Image, ramp: List[Tuple[float, str]]) -> np.ndarray:
+    rgba = np.array(image.convert("RGBA"), dtype=np.uint8)
+    output = np.zeros(rgba.shape[:2], dtype=np.float32)
+    mask = rgba[:, :, 3] > 0
+    if not np.any(mask):
+        return output
+
+    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int16)
+    values = np.array([value for value, _ in ramp], dtype=np.float32)
+    pixels = rgba[:, :, :3][mask].astype(np.int16)
+    distances = np.sum((pixels[:, None, :] - colors[None, :, :]) ** 2, axis=2)
+    output[mask] = values[np.argmin(distances, axis=1)]
+    return np.where(output < RADAR_MIN_VALUE, 0.0, output).astype(np.float32)
+
+
+def eccc_radar_wms_url(bounds: Tuple[float, float, float, float]) -> str:
+    west, south, east, north = bounds
+    width = int(os.getenv("CANADA_RADAR_WIDTH", "1800"))
+    height = int(os.getenv("CANADA_RADAR_HEIGHT", "900"))
+    params = {
+        "SERVICE": "WMS",
+        "VERSION": "1.3.0",
+        "REQUEST": "GetMap",
+        "LAYERS": ECCC_RADAR_LAYER,
+        "STYLES": ECCC_RADAR_STYLE,
+        "FORMAT": "image/png",
+        "TRANSPARENT": "true",
+        "CRS": "EPSG:4326",
+        "WIDTH": str(width),
+        "HEIGHT": str(height),
+        "BBOX": f"{south},{west},{north},{east}",
+    }
+    return f"{ECCC_GEOMET_URL}?{urlencode(params)}"
+
+
+def fetch_canada_geomet_radar(client: requests.Session) -> RadarGrid:
+    bounds = REGION_BOUNDS["Canada"]
+    west, south, east, north = bounds
+    image_url = eccc_radar_wms_url(bounds)
+    image_bytes, image_time = get_bytes(client, image_url)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        values = rgba_to_color_ramp_values(image, ECCC_RADAR_COLOR_RAMP)
+    height, width = values.shape
+    x_pixel_size = (east - west) / max(width - 1, 1)
+    y_pixel_size = (south - north) / max(height - 1, 1)
+    values, latitudes, longitudes = sample_grid(values, x_pixel_size, y_pixel_size, west, north)
+    return RadarGrid(
+        provider_id="radar_canada_configured",
+        name="Canada Radar Intensity",
+        values=values,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        ref_time=image_time,
+        source_url="https://eccc-msc.github.io/open-data/msc-data/obs_radar/readme_radar_geomet_en/",
+        attribution="Environment and Climate Change Canada / MSC GeoMet",
+        region="Canada",
+        units="mm/h",
+    )
+
+
+def fetch_jma_nowcast(client: requests.Session) -> RadarGrid:
+    response = client.get(JMA_NOWCAST_TIMES_URL, timeout=TIMEOUT)
+    response.raise_for_status()
+    times = response.json()
+    if not times:
+        raise ValueError("JMA nowcast time feed is empty")
+    frame = times[0]
+    base_time = frame["basetime"]
+    valid_time = frame["validtime"]
+    zoom = int(os.getenv("JMA_RADAR_ZOOM", "6"))
+    bounds = REGION_BOUNDS["Japan"]
+    west, south, east, north = bounds
+    x_start = lon_to_tile_x(west, zoom)
+    x_end = lon_to_tile_x(east, zoom)
+    y_start = lat_to_tile_y(north, zoom)
+    y_end = lat_to_tile_y(south, zoom)
+
+    rows = []
+    for tile_y in range(y_start, y_end + 1):
+        row_tiles = []
+        for tile_x in range(x_start, x_end + 1):
+            url = JMA_NOWCAST_TILE_TEMPLATE.format(
+                base_time=base_time,
+                valid_time=valid_time,
+                z=zoom,
+                x=tile_x,
+                y=tile_y,
+            )
+            image_bytes, _ = get_bytes(client, url)
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                row_tiles.append(rgba_to_configured_values(image, JMA_HRPNS_COLOR_VALUES))
+        rows.append(np.concatenate(row_tiles, axis=1))
+
+    values = np.concatenate(rows, axis=0)
+    lon_values = []
+    for tile_x in range(x_start, x_end + 1):
+        lon_values.append(tile_pixel_to_lonlat(tile_x, y_start, zoom, 256)[0])
+    longitudes = np.concatenate(lon_values)
+    lat_values = []
+    for tile_y in range(y_start, y_end + 1):
+        lat_values.append(tile_pixel_to_lonlat(x_start, tile_y, zoom, 256)[1])
+    latitudes = np.concatenate(lat_values)
+
+    lon_mask = (longitudes >= west) & (longitudes <= east)
+    lat_mask = (latitudes >= south) & (latitudes <= north)
+    values = values[np.ix_(lat_mask, lon_mask)]
+    latitudes = latitudes[lat_mask]
+    longitudes = longitudes[lon_mask]
+    values, latitudes, longitudes = sample_grid(
+        values,
+        longitudes[1] - longitudes[0],
+        latitudes[1] - latitudes[0],
+        longitudes[0],
+        latitudes[0],
+    )
+    return RadarGrid(
+        provider_id="radar_japan_configured",
+        name="Japan Radar Intensity",
+        values=values,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        ref_time=parse_jma_time(valid_time),
+        source_url="https://www.jma.go.jp/jp/radnowc/index.html",
+        attribution="Japan Meteorological Agency",
+        region="Japan",
+        units="mm/h",
     )
 
 
@@ -1141,6 +1340,38 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             "United States",
             IEM_N0Q_DOCS_URL,
             "Iowa Environmental Mesonet / NOAA NEXRAD",
+            exc,
+        )
+        results.append(result)
+        result_ids.add(result["id"])
+
+    try:
+        result = generate_tiles(fetch_canada_geomet_radar(client))
+        results.append(result)
+        result_ids.add(result["id"])
+    except Exception as exc:
+        result = provider_error(
+            "radar_canada_configured",
+            "Canada Radar Intensity",
+            "Canada",
+            ECCC_GEOMET_URL,
+            "Environment and Climate Change Canada / MSC GeoMet",
+            exc,
+        )
+        results.append(result)
+        result_ids.add(result["id"])
+
+    try:
+        result = generate_tiles(fetch_jma_nowcast(client))
+        results.append(result)
+        result_ids.add(result["id"])
+    except Exception as exc:
+        result = provider_error(
+            "radar_japan_configured",
+            "Japan Radar Intensity",
+            "Japan",
+            "https://www.jma.go.jp/jp/radnowc/index.html",
+            "Japan Meteorological Agency",
             exc,
         )
         results.append(result)
