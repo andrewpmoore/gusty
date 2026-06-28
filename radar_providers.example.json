@@ -1,0 +1,52 @@
+{
+  "providers": [
+    {
+      "id": "radar_canada_configured",
+      "name": "Canada MSC Radar",
+      "region": "Canada",
+      "units": "mm/h",
+      "attribution": "Environment and Climate Change Canada / MSC GeoMet",
+      "source_url": "https://geo.weather.gc.ca/geomet",
+      "wms": {
+        "url": "https://geo.weather.gc.ca/geomet",
+        "layers": "RADAR_1KM_RRAI",
+        "styles": "",
+        "version": "1.3.0",
+        "crs": "EPSG:4326",
+        "width": 1200,
+        "height": 1200,
+        "format": "image/png"
+      },
+      "color_values": {
+        "#00ffff": 0.5,
+        "#0099ff": 1.0,
+        "#0000ff": 2.0,
+        "#00ff00": 4.0,
+        "#ffff00": 8.0,
+        "#ff9900": 16.0,
+        "#ff0000": 32.0,
+        "#9900ff": 64.0
+      }
+    },
+    {
+      "id": "radar_example_image",
+      "name": "Example Paletted Image Radar",
+      "region": "Example Region",
+      "image_url": "https://example.invalid/radar/latest.png",
+      "bounds": [-125.0, 24.0, -66.0, 50.0],
+      "units": "dBZ",
+      "attribution": "Example radar provider",
+      "source_url": "https://example.invalid/radar",
+      "index_values": {
+        "1": 0.0,
+        "65": 5.0,
+        "85": 15.0,
+        "105": 25.0,
+        "125": 35.0,
+        "145": 45.0,
+        "165": 55.0,
+        "185": 65.0
+      }
+    }
+  ]
+}
