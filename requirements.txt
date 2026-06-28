@@ -2,4 +2,5 @@ requests==2.26.0
 numpy
 xarray
 cfgrib
+eccodes
 Pillow

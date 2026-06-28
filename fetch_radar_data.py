@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import gzip
 import io
 import json
 import math
@@ -7,6 +8,8 @@ import os
 import re
 import shutil
 import struct
+import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -19,6 +22,7 @@ from PIL import Image
 
 OUTPUT_DIR = "public/data"
 RADAR_DIR = os.path.join(OUTPUT_DIR, "radar")
+RADAR_VECTOR_DIR = os.path.join(OUTPUT_DIR, "radar_vectors")
 LAYER_DIR = os.path.join(OUTPUT_DIR, "layers")
 TIMEOUT = 90
 USER_AGENT = os.getenv(
@@ -28,7 +32,9 @@ USER_AGENT = os.getenv(
 
 IEM_CURRENT_URL = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP"
 IEM_N0Q_DOCS_URL = "https://mesonet.agron.iastate.edu/docs/nexrad_composites/"
-RAINVIEWER_SOURCES_URL = "https://www.rainviewer.com/sources.html"
+MRMS_BUCKET_URL = "https://noaa-mrms-pds.s3.amazonaws.com"
+MRMS_PRODUCT_PREFIX = "CONUS/PrecipRate_00.00"
+MRMS_DOCS_URL = "https://registry.opendata.aws/noaa-mrms/"
 MET_OFFICE_PUBLIC_RADAR_URL = "https://www.metoffice.gov.uk/public/weather/observation/map/#?map=Rainfall"
 MET_OFFICE_DATAHUB_URL = "https://datahub.metoffice.gov.uk/"
 ECCC_GEOMET_URL = "https://geo.weather.gc.ca/geomet"
@@ -52,7 +58,7 @@ CONFIGURABLE_RADAR_REGIONS = [
         "region": "Ireland",
         "attribution": "Met Eireann / Met Office where applicable",
         "source_url": "https://www.met.ie/",
-        "notes": "RainViewer attributes Ireland to Met Office and Met Eireann; configure an approved image or WMS endpoint.",
+        "notes": "Configure an approved Met Eireann or Met Office image/WMS endpoint with a declared palette mapping.",
     },
     {
         "id": "radar_canada_configured",
@@ -146,9 +152,9 @@ CONFIGURABLE_RADAR_REGIONS = [
         "id": "radar_brazil_configured",
         "name": "Brazil Radar Intensity",
         "region": "Brazil",
-        "attribution": "Brazilian radar providers listed by RainViewer",
+        "attribution": "Brazilian radar providers",
         "source_url": "https://www.redemet.aer.mil.br/",
-        "notes": "RainViewer lists multiple Brazil providers; configure one composite or regional endpoint at a time.",
+        "notes": "Multiple regional radar providers are available; configure one composite or regional endpoint at a time.",
     },
     {
         "id": "radar_argentina_configured",
@@ -170,7 +176,7 @@ ADDITIONAL_CONFIGURABLE_REGION_SOURCES = [
     ("Belgium", "Royal Meteorological Institute of Belgium", "http://www.meteo.be/meteo/view/en/123361-Radar.html"),
     ("Belize", "National Meteorological Service of Belize", "http://nms.gov.bz/sensors/radar-imagery/"),
     ("Bermuda", "Bermuda Weather Service", "http://www.weather.bm/tools/graphics.asp?name=250KM%20SRI"),
-    ("Brazil", "Brazilian radar providers listed by RainViewer", "https://www.redemet.aer.mil.br/"),
+    ("Brazil", "Brazilian radar providers", "https://www.redemet.aer.mil.br/"),
     ("Bulgaria", "Bulgarian Hail Suppression Agency", "https://www.weathermod-bg.eu"),
     ("Cambodia", "Cambodia Ministry of Water Resources and Meteorology", "http://www.cambodiameteo.com/slideshow?menu=117&lang=km&domain=CAMBODIA"),
     ("Canada", "Environment and Climate Change Canada / MSC GeoMet", "https://geo.weather.gc.ca/geomet"),
@@ -221,7 +227,7 @@ ADDITIONAL_CONFIGURABLE_REGION_SOURCES = [
     ("Poland", "IMGW", "https://danepubliczne.imgw.pl/datastore"),
     ("Portugal", "IPMA", "http://www.ipma.pt/pt/otempo/obs.remote/index.jsp"),
     ("Romania", "Romanian National Meteorological Administration", "http://meteoromania.ro/anm2/radarm/radar.index.php"),
-    ("Saudi Arabia", "Saudi radar provider listed by RainViewer", "https://www.radar-flask.xyz"),
+    ("Saudi Arabia", "Saudi radar provider", "https://www.radar-flask.xyz"),
     ("Serbia", "Republic Hydrometeorological Service of Serbia", "http://www.hidmet.gov.rs/ciril/osmotreni/radarska3.php"),
     ("Singapore", "Meteorological Service Singapore", "http://www.weather.gov.sg/weather-rain-area-50km/"),
     ("Slovakia", "Slovak Hydrometeorological Institute", "http://www.shmu.sk/en/?page=65&id="),
@@ -293,6 +299,7 @@ REGION_BOUNDS = {
     "Myanmar": [92.0, 9.5, 101.2, 28.7],
     "Netherlands": [3.1, 50.6, 7.3, 53.7],
     "New Zealand": [166.0, -47.5, 179.0, -34.0],
+    "North America": [-130.0, 20.0, -60.0, 55.0],
     "Oman": [52.0, 16.5, 60.0, 26.6],
     "Pakistan": [60.8, 23.5, 77.2, 37.1],
     "Panama": [-83.1, 7.0, -77.0, 9.9],
@@ -348,6 +355,12 @@ PROVIDER_ENDPOINTS = {
         "tile_url_template": JMA_NOWCAST_TILE_TEMPLATE,
         "machine_readable": True,
         "endpoint_notes": "Active provider: JMA nowcast time feed and hrpns raster tiles are stitched into numeric Gusty packs.",
+    },
+    "North America": {
+        "endpoint_type": "grib2-s3-open-data",
+        "endpoint_url": MRMS_BUCKET_URL,
+        "machine_readable": True,
+        "endpoint_notes": "Active provider: NOAA MRMS PrecipRate GRIB2 files from the public AWS Open Data bucket.",
     },
     "Netherlands": {
         "endpoint_type": "open-data-api",
@@ -491,7 +504,27 @@ def env_float(name: str, default: float) -> float:
 
 
 RADAR_TARGET_DEGREES = env_float("RADAR_TARGET_DEGREES", 0.025)
-RADAR_MIN_VALUE = env_float("RADAR_MIN_VALUE", env_float("RADAR_MIN_DBZ", 0))
+MRMS_TARGET_DEGREES = env_float("MRMS_TARGET_DEGREES", max(RADAR_TARGET_DEGREES, 0.05))
+RADAR_MIN_VALUE = env_float("RADAR_MIN_VALUE", 0)
+RADAR_VALUE_PARAMETER = "rain_rate"
+RADAR_VALUE_UNITS = "mm/h"
+RADAR_SOURCE_REFERENCE = "official and public meteorological radar provider references"
+RADAR_COLOR_STOPS = [
+    {"value": 0.1, "label": "trace"},
+    {"value": 1.0, "label": "light"},
+    {"value": 4.0, "label": "moderate"},
+    {"value": 16.0, "label": "heavy"},
+    {"value": 32.0, "label": "very_heavy"},
+    {"value": 64.0, "label": "extreme"},
+]
+RADAR_VECTOR_BANDS = [
+    {"min": 0.1, "max": 1.0, "class": "trace"},
+    {"min": 1.0, "max": 4.0, "class": "light"},
+    {"min": 4.0, "max": 16.0, "class": "moderate"},
+    {"min": 16.0, "max": 32.0, "class": "heavy"},
+    {"min": 32.0, "max": 64.0, "class": "very_heavy"},
+    {"min": 64.0, "max": None, "class": "extreme"},
+]
 
 TILE_FORMAT = {
     "name": "gusty-grid",
@@ -513,6 +546,26 @@ PACK_FORMAT = {
     "overview_sample_step": OVERVIEW_SAMPLE_STEP,
     "offset_base": "start_of_data_section",
 }
+VECTOR_TILE_FORMAT = {
+    "name": "gusty-vector-json",
+    "version": 1,
+    "extension": "gjson",
+    "encoding": "utf-8-json",
+    "geometry": "polygon",
+    "coordinates": "lonlat",
+    "parameter": RADAR_VALUE_PARAMETER,
+    "units": RADAR_VALUE_UNITS,
+    "bands": RADAR_VECTOR_BANDS,
+}
+VECTOR_PACK_FORMAT = {
+    "name": "gusty-vector-pack",
+    "version": 1,
+    "extension": "gpack",
+    "contains": VECTOR_TILE_FORMAT["extension"],
+    "lat_size": PACK_LAT_SIZE,
+    "lon_size": PACK_LON_SIZE,
+    "offset_base": "start_of_data_section",
+}
 
 MAGIC = b"GSTY"
 VERSION = 1
@@ -521,7 +574,7 @@ INT16_MIN_VALUE = -32767
 INT16_MAX_VALUE = 32767
 PACK_MAGIC = b"GPAK"
 PACK_VERSION = 1
-PARAMETER_DBZ = 0
+PARAMETER_RAIN_RATE = 0
 
 
 @dataclass
@@ -535,7 +588,10 @@ class RadarGrid:
     source_url: str
     attribution: str
     region: str
-    units: str = "dBZ"
+    units: str = RADAR_VALUE_UNITS
+    source_units: Optional[str] = None
+    source_parameter: Optional[str] = None
+    target_degrees: float = RADAR_TARGET_DEGREES
     status: str = "ok"
     error: Optional[str] = None
 
@@ -569,6 +625,14 @@ def clean_provider_dir(provider_id: str) -> str:
     return provider_dir
 
 
+def clean_vector_provider_dir(provider_id: str) -> str:
+    provider_dir = os.path.join(RADAR_VECTOR_DIR, provider_id)
+    if os.path.exists(provider_dir):
+        shutil.rmtree(provider_dir)
+    os.makedirs(provider_dir, exist_ok=True)
+    return provider_dir
+
+
 def coordinate_label(lat_start: int, lon_start: int) -> Tuple[str, str]:
     lat_label = f"N{abs(lat_start)}" if lat_start >= 0 else f"S{abs(lat_start)}"
     lon_label = f"E{abs(lon_start)}" if lon_start >= 0 else f"W{abs(lon_start)}"
@@ -595,6 +659,93 @@ def pack_filename(provider_id: str, frame: int, lat_start: int, lon_start: int) 
 
 def overview_tile_key(lat_start: int, lon_start: int) -> str:
     return f"{tile_key(lat_start, lon_start)}{OVERVIEW_KEY_SUFFIX}"
+
+
+def vector_band_index(value: float) -> Optional[int]:
+    if value < RADAR_VECTOR_BANDS[0]["min"]:
+        return None
+    for index, band in enumerate(RADAR_VECTOR_BANDS):
+        max_value = band["max"]
+        if value >= band["min"] and (max_value is None or value < max_value):
+            return index
+    return None
+
+
+def vector_tile_bytes(
+    lon_vals: np.ndarray,
+    lat_vals: np.ndarray,
+    dx: float,
+    dy: float,
+    values: np.ndarray,
+) -> Optional[bytes]:
+    if values.size == 0 or float(np.nanmax(values)) < RADAR_VECTOR_BANDS[0]["min"]:
+        return None
+
+    features = []
+    lon_half = abs(dx) / 2.0
+    lat_half = abs(dy) / 2.0
+    for row_index, lat in enumerate(lat_vals):
+        current_band: Optional[int] = None
+        run_start: Optional[int] = None
+        run_values: List[float] = []
+        row_values = values[row_index]
+        for col_index in range(len(lon_vals) + 1):
+            if col_index < len(lon_vals):
+                value = float(row_values[col_index])
+                band_index = vector_band_index(value)
+            else:
+                value = 0.0
+                band_index = None
+
+            if band_index == current_band:
+                if band_index is not None:
+                    run_values.append(value)
+                continue
+
+            if current_band is not None and run_start is not None and run_values:
+                lon_min = float(lon_vals[run_start] - lon_half)
+                lon_max = float(lon_vals[col_index - 1] + lon_half)
+                lat_min = float(lat - lat_half)
+                lat_max = float(lat + lat_half)
+                band = RADAR_VECTOR_BANDS[current_band]
+                features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "class": band["class"],
+                            "min": band["min"],
+                            "max": band["max"],
+                            "value": round(max(run_values), 1),
+                        },
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [
+                                    [round(lon_min, 5), round(lat_min, 5)],
+                                    [round(lon_max, 5), round(lat_min, 5)],
+                                    [round(lon_max, 5), round(lat_max, 5)],
+                                    [round(lon_min, 5), round(lat_max, 5)],
+                                    [round(lon_min, 5), round(lat_min, 5)],
+                                ]
+                            ],
+                        },
+                    }
+                )
+
+            current_band = band_index
+            run_start = col_index if band_index is not None else None
+            run_values = [value] if band_index is not None else []
+
+    if not features:
+        return None
+
+    payload = {
+        "type": "FeatureCollection",
+        "parameter": RADAR_VALUE_PARAMETER,
+        "units": RADAR_VALUE_UNITS,
+        "features": features,
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def quantize_int16(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
@@ -639,7 +790,7 @@ def build_binary_tile_bytes(
         )
     )
     quantized, scale, offset = quantize_int16(flattened)
-    header.extend(struct.pack("<hff", PARAMETER_DBZ, scale, offset))
+    header.extend(struct.pack("<hff", PARAMETER_RAIN_RATE, scale, offset))
     output = bytearray(header)
     output.extend(quantized.tobytes())
     return bytes(output)
@@ -706,8 +857,26 @@ def read_world_file(text: str) -> Tuple[float, float, float, float]:
 def n0q_indices_to_dbz(index_values: np.ndarray) -> np.ndarray:
     dbz = -32.0 + (index_values.astype(np.float32) - 1.0) * 0.5
     dbz = np.where(index_values <= 1, 0.0, dbz)
-    dbz = np.where(dbz < RADAR_MIN_VALUE, 0.0, dbz)
     return np.clip(dbz, 0.0, 90.0).astype(np.float32)
+
+
+def dbz_to_rain_rate(dbz: np.ndarray) -> np.ndarray:
+    z = np.power(10.0, dbz.astype(np.float32) / 10.0)
+    rain_rate = np.power(z / 200.0, 1.0 / 1.6)
+    rain_rate = np.where(dbz <= 0, 0.0, rain_rate)
+    rain_rate = np.where(rain_rate < RADAR_MIN_VALUE, 0.0, rain_rate)
+    return np.clip(rain_rate, 0.0, 250.0).astype(np.float32)
+
+
+def standardize_values(values: np.ndarray, units: Optional[str]) -> Tuple[np.ndarray, Optional[str], Optional[str]]:
+    source_units = units or RADAR_VALUE_UNITS
+    normalized_units = source_units.strip().lower().replace(" ", "")
+    if normalized_units in {"dbz", "db"}:
+        return dbz_to_rain_rate(values), source_units, "reflectivity"
+    if normalized_units in {"mm/h", "mm/hr", "mmh", "mmperhour", "mm/hour"}:
+        rain_rate = np.where(values < RADAR_MIN_VALUE, 0.0, values)
+        return rain_rate.astype(np.float32), source_units, "rain_rate"
+    raise ValueError(f"Unsupported radar units for unified rain-rate output: {source_units}")
 
 
 def parse_index_values(value: str) -> np.ndarray:
@@ -805,6 +974,113 @@ def sample_grid(
     return sampled, latitudes, longitudes
 
 
+def sample_lonlat_grid(
+    values: np.ndarray,
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    target_degrees: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    latitudes = np.asarray(latitudes, dtype=np.float64)
+    longitudes = np.asarray(longitudes, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float32)
+    lat_resolution = abs(float(np.nanmedian(np.diff(latitudes)))) if len(latitudes) > 1 else target_degrees
+    lon_resolution = abs(float(np.nanmedian(np.diff(longitudes)))) if len(longitudes) > 1 else target_degrees
+    native_resolution = max(min(lat_resolution, lon_resolution), 0.0001)
+    sample_step = max(1, int(round(target_degrees / native_resolution)))
+    sampled = values[::sample_step, ::sample_step]
+    sampled_latitudes = latitudes[::sample_step]
+    sampled_longitudes = longitudes[::sample_step]
+    if sampled_latitudes[0] < sampled_latitudes[-1]:
+        sampled = sampled[::-1, :]
+        sampled_latitudes = sampled_latitudes[::-1]
+    if sampled_longitudes[0] > sampled_longitudes[-1]:
+        order = np.argsort(sampled_longitudes)
+        sampled = sampled[:, order]
+        sampled_longitudes = sampled_longitudes[order]
+    return sampled, sampled_latitudes, sampled_longitudes
+
+
+def parse_mrms_time_from_key(key: str) -> Optional[str]:
+    match = re.search(r"_(\d{8})-(\d{6})\.grib2\.gz$", key)
+    if not match:
+        return None
+    parsed = dt.datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")
+    return parsed.replace(tzinfo=dt.timezone.utc).isoformat()
+
+
+def list_mrms_preciprate_keys(client: requests.Session, day: dt.date) -> List[Tuple[str, str]]:
+    prefix = f"{MRMS_PRODUCT_PREFIX}/{day:%Y%m%d}/"
+    params = urlencode({"list-type": "2", "prefix": prefix, "max-keys": "1000"})
+    text, _ = get_text(client, f"{MRMS_BUCKET_URL}/?{params}")
+    root = ET.fromstring(text)
+    namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    keys = []
+    for item in root.findall("s3:Contents", namespace):
+        key = item.findtext("s3:Key", default="", namespaces=namespace)
+        modified = item.findtext("s3:LastModified", default="", namespaces=namespace)
+        if key.endswith(".grib2.gz"):
+            keys.append((modified, key))
+    return keys
+
+
+def latest_mrms_preciprate_key(client: requests.Session) -> Tuple[str, Optional[str]]:
+    today = dt.datetime.now(dt.timezone.utc).date()
+    keys: List[Tuple[str, str]] = []
+    for offset in (0, 1):
+        keys.extend(list_mrms_preciprate_keys(client, today - dt.timedelta(days=offset)))
+        if keys:
+            break
+    if not keys:
+        raise ValueError("No current MRMS PrecipRate GRIB2 files found")
+    modified, key = max(keys, key=lambda item: item[0])
+    return key, modified or None
+
+
+def fetch_mrms_precip_rate(client: requests.Session) -> RadarGrid:
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise RuntimeError("NOAA MRMS decoding requires xarray and cfgrib") from exc
+
+    key, modified = latest_mrms_preciprate_key(client)
+    grib_gz_url = f"{MRMS_BUCKET_URL}/{key}"
+    grib_gz_bytes, http_time = get_bytes(client, grib_gz_url)
+    grib_bytes = gzip.decompress(grib_gz_bytes)
+    with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
+        handle.write(grib_bytes)
+        handle.flush()
+        dataset = xr.open_dataset(handle.name, engine="cfgrib", backend_kwargs={"indexpath": ""})
+        data_var = next(iter(dataset.data_vars))
+        data = dataset[data_var]
+        values = data.values.astype(np.float32)
+        latitudes = dataset["latitude"].values.astype(np.float64)
+        longitudes = dataset["longitude"].values.astype(np.float64)
+        valid_time = dataset.coords.get("valid_time")
+        ref_time = None
+        if valid_time is not None:
+            ref_time = np.datetime_as_string(valid_time.values, unit="s") + "+00:00"
+
+    longitudes = np.where(longitudes > 180.0, longitudes - 360.0, longitudes)
+    values = np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
+    values = np.clip(values, 0.0, 250.0).astype(np.float32)
+    values, latitudes, longitudes = sample_lonlat_grid(values, latitudes, longitudes, MRMS_TARGET_DEGREES)
+    return RadarGrid(
+        provider_id="radar_north_america_mrms",
+        name="North America MRMS Rain Rate",
+        values=values,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        ref_time=ref_time or parse_mrms_time_from_key(key) or http_time or modified,
+        source_url=MRMS_DOCS_URL,
+        attribution="NOAA MRMS / AWS Open Data",
+        region="North America",
+        units=RADAR_VALUE_UNITS,
+        source_units=RADAR_VALUE_UNITS,
+        source_parameter=RADAR_VALUE_PARAMETER,
+        target_degrees=MRMS_TARGET_DEGREES,
+    )
+
+
 def fetch_us_iem_nexrad(client: requests.Session) -> RadarGrid:
     image_url = f"{IEM_CURRENT_URL}/n0q_0.png"
     world_url = f"{IEM_CURRENT_URL}/n0q_0.wld"
@@ -813,10 +1089,11 @@ def fetch_us_iem_nexrad(client: requests.Session) -> RadarGrid:
     x_pixel_size, y_pixel_size, x_origin, y_origin = read_world_file(world_text)
     indices = image_to_palette_indices(image_bytes)
     dbz = n0q_indices_to_dbz(indices)
-    values, latitudes, longitudes = sample_grid(dbz, x_pixel_size, y_pixel_size, x_origin, y_origin)
+    rain_rate, source_units, source_parameter = standardize_values(dbz, "dBZ")
+    values, latitudes, longitudes = sample_grid(rain_rate, x_pixel_size, y_pixel_size, x_origin, y_origin)
     return RadarGrid(
         provider_id="radar_us_iem_nexrad",
-        name="US NEXRAD Reflectivity",
+        name="US NEXRAD Rain Rate",
         values=values,
         latitudes=latitudes,
         longitudes=longitudes,
@@ -824,6 +1101,8 @@ def fetch_us_iem_nexrad(client: requests.Session) -> RadarGrid:
         source_url=IEM_N0Q_DOCS_URL,
         attribution="Iowa Environmental Mesonet / NOAA NEXRAD",
         region="United States",
+        source_units=source_units,
+        source_parameter=source_parameter,
     )
 
 
@@ -943,6 +1222,8 @@ def fetch_canada_geomet_radar(client: requests.Session) -> RadarGrid:
         attribution="Environment and Climate Change Canada / MSC GeoMet",
         region="Canada",
         units="mm/h",
+        source_units="mm/h",
+        source_parameter=RADAR_VALUE_PARAMETER,
     )
 
 
@@ -1012,6 +1293,8 @@ def fetch_jma_nowcast(client: requests.Session) -> RadarGrid:
         attribution="Japan Meteorological Agency",
         region="Japan",
         units="mm/h",
+        source_units="mm/h",
+        source_parameter=RADAR_VALUE_PARAMETER,
     )
 
 
@@ -1078,7 +1361,11 @@ def fetch_configured_radar(client: requests.Session, config: Dict[str, Any]) -> 
     image_url = config.get("image_url") or wms_image_url(config, bounds)
     west, south, east, north = bounds
     image_bytes, image_time = get_bytes(client, image_url)
-    values = configured_image_values(image_bytes, config)
+    source_units = config.get("units", RADAR_VALUE_UNITS)
+    values, standardized_source_units, source_parameter = standardize_values(
+        configured_image_values(image_bytes, config),
+        source_units,
+    )
     height, width = values.shape
     x_pixel_size = (east - west) / max(width - 1, 1)
     y_pixel_size = (south - north) / max(height - 1, 1)
@@ -1093,7 +1380,9 @@ def fetch_configured_radar(client: requests.Session, config: Dict[str, Any]) -> 
         source_url=config.get("source_url") or image_url,
         attribution=config.get("attribution", provider_id),
         region=config.get("region", "Configured radar"),
-        units=config.get("units", "dBZ"),
+        units=RADAR_VALUE_UNITS,
+        source_units=standardized_source_units,
+        source_parameter=source_parameter,
     )
 
 
@@ -1108,7 +1397,7 @@ def fetch_configured_uk_radar(client: requests.Session) -> Optional[RadarGrid]:
         "image_url": image_url,
         "bounds": os.getenv("UK_RADAR_IMAGE_BOUNDS"),
         "index_values": os.getenv("UK_RADAR_INDEX_VALUES"),
-        "units": os.getenv("UK_RADAR_UNITS") or "dBZ",
+        "units": os.getenv("UK_RADAR_UNITS") or RADAR_VALUE_UNITS,
         "ref_time": os.getenv("UK_RADAR_REF_TIME"),
         "source_url": os.getenv("UK_RADAR_SOURCE_URL") or MET_OFFICE_PUBLIC_RADAR_URL,
         "attribution": os.getenv("UK_RADAR_ATTRIBUTION") or "Met Office",
@@ -1140,8 +1429,12 @@ def build_overview_tile(
 
 def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
     provider_dir = clean_provider_dir(grid.provider_id)
+    vector_provider_dir = clean_vector_provider_dir(grid.provider_id)
     pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes, int, int]]] = {}
+    vector_pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes]]] = {}
     tile_count = 0
+    vector_tile_count = 0
+    vector_feature_count = 0
     max_value = float(np.nanmax(grid.values)) if grid.values.size else 0.0
 
     for lat_start in tile_range(grid.latitudes, TILE_SIZE):
@@ -1169,6 +1462,15 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
             )
             tile_count += 1
 
+            vector_bytes = vector_tile_bytes(lon_vals, lat_vals, dx, dy, tile_values)
+            if vector_bytes:
+                vector_pack_entries.setdefault(pack_start, []).append((tile_key(lat_start, lon_start), vector_bytes))
+                vector_tile_count += 1
+                try:
+                    vector_feature_count += len(json.loads(vector_bytes.decode("utf-8")).get("features", []))
+                except json.JSONDecodeError:
+                    pass
+
     pack_count = 0
     for (pack_lat_start, pack_lon_start), pack_tiles in pack_entries.items():
         entries = [(key, tile_bytes) for key, tile_bytes, _, _ in pack_tiles]
@@ -1187,6 +1489,15 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
         write_tile_pack(pack_path, entries)
         pack_count += 1
 
+    vector_pack_count = 0
+    for (pack_lat_start, pack_lon_start), pack_tiles in vector_pack_entries.items():
+        pack_path = os.path.join(
+            vector_provider_dir,
+            pack_filename(grid.provider_id, 0, pack_lat_start, pack_lon_start),
+        )
+        write_tile_pack(pack_path, pack_tiles)
+        vector_pack_count += 1
+
     return {
         "id": grid.provider_id,
         "name": grid.name,
@@ -1197,8 +1508,16 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
         "tiles": tile_count,
         "packs": pack_count,
         "max_value": round(max_value, 1),
-        "units": grid.units,
+        "units": RADAR_VALUE_UNITS,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
+        "source_units": grid.source_units,
+        "source_parameter": grid.source_parameter,
         "path": f"radar/{grid.provider_id}",
+        "vector_path": f"radar_vectors/{grid.provider_id}",
+        "vector_tiles": vector_tile_count,
+        "vector_packs": vector_pack_count,
+        "vector_features": vector_feature_count,
         "attribution": grid.attribution,
         "source_url": grid.source_url,
         "provider_url": grid.source_url,
@@ -1206,12 +1525,15 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
         **provider_endpoint(grid.region),
         "tile_format": TILE_FORMAT,
         "pack_format": PACK_FORMAT,
+        "vector_tile_format": VECTOR_TILE_FORMAT,
+        "vector_pack_format": VECTOR_PACK_FORMAT,
         "metadata": {
-            "parameter": "radar_intensity",
-            "units": grid.units,
+            "parameter": RADAR_VALUE_PARAMETER,
+            "units": RADAR_VALUE_UNITS,
             "value_range": [0, max(1, round(max_value, 1))],
-            "target_degrees": RADAR_TARGET_DEGREES,
+            "target_degrees": grid.target_degrees,
             "client_coloring": True,
+            "recommended_color_stops": RADAR_COLOR_STOPS,
         },
     }
 
@@ -1226,7 +1548,14 @@ def provider_error(provider_id: str, name: str, region: str, source_url: str, at
         "error": str(exc),
         "tiles": 0,
         "packs": 0,
+        "units": RADAR_VALUE_UNITS,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
         "path": f"radar/{provider_id}",
+        "vector_path": f"radar_vectors/{provider_id}",
+        "vector_tiles": 0,
+        "vector_packs": 0,
+        "vector_features": 0,
         "attribution": attribution,
         "source_url": source_url,
         "provider_url": source_url,
@@ -1245,7 +1574,14 @@ def configuration_pending_manifest(template: Dict[str, Any]) -> Dict[str, Any]:
         "region": template["region"],
         "tiles": 0,
         "packs": 0,
+        "units": RADAR_VALUE_UNITS,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
         "path": f"radar/{template['id']}",
+        "vector_path": f"radar_vectors/{template['id']}",
+        "vector_tiles": 0,
+        "vector_packs": 0,
+        "vector_features": 0,
         "attribution": template["attribution"],
         "source_url": template["source_url"],
         "provider_url": template["source_url"],
@@ -1280,9 +1616,17 @@ def layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "bounds": result.get("bounds"),
                 "status": result["status"],
                 "path": result["path"],
-                "units": result.get("units", "dBZ"),
+                "vector_path": result.get("vector_path"),
+                "units": RADAR_VALUE_UNITS,
+                "value_parameter": result.get("value_parameter", RADAR_VALUE_PARAMETER),
+                "value_units": result.get("value_units", RADAR_VALUE_UNITS),
+                "source_units": result.get("source_units"),
+                "source_parameter": result.get("source_parameter"),
                 "tiles": result.get("tiles", 0),
                 "packs": result.get("packs", 0),
+                "vector_tiles": result.get("vector_tiles", 0),
+                "vector_packs": result.get("vector_packs", 0),
+                "vector_features": result.get("vector_features", 0),
                 "ref_time": result.get("ref_time"),
                 "attribution": result.get("attribution"),
                 "source_url": result.get("source_url"),
@@ -1292,6 +1636,41 @@ def layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "endpoint_type": result.get("endpoint_type"),
                 "machine_readable": result.get("machine_readable"),
                 "metadata": result.get("metadata"),
+                "vector_tile_format": result.get("vector_tile_format"),
+                "vector_pack_format": result.get("vector_pack_format"),
+            }
+            for result in provider_results
+        ],
+    }
+
+
+def vector_layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "generated_at": now_iso(),
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
+        "recommended_color_stops": RADAR_COLOR_STOPS,
+        "layers": [
+            {
+                "id": f"{result['id']}_vectors",
+                "source_layer_id": result["id"],
+                "name": f"{result['name']} Vectors",
+                "type": "gusty-vector-pack",
+                "region": result["region"],
+                "bounds": result.get("bounds"),
+                "status": result["status"],
+                "path": result.get("vector_path"),
+                "value_parameter": result.get("value_parameter", RADAR_VALUE_PARAMETER),
+                "value_units": result.get("value_units", RADAR_VALUE_UNITS),
+                "tiles": result.get("vector_tiles", 0),
+                "packs": result.get("vector_packs", 0),
+                "features": result.get("vector_features", 0),
+                "ref_time": result.get("ref_time"),
+                "attribution": result.get("attribution"),
+                "source_url": result.get("source_url"),
+                "provider_url": result.get("provider_url") or result.get("source_url"),
+                "vector_tile_format": result.get("vector_tile_format", VECTOR_TILE_FORMAT),
+                "vector_pack_format": result.get("vector_pack_format", VECTOR_PACK_FORMAT),
             }
             for result in provider_results
         ],
@@ -1301,7 +1680,9 @@ def layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 def provider_catalog() -> Dict[str, Any]:
     return {
         "generated_at": now_iso(),
-        "source_attribution": RAINVIEWER_SOURCES_URL,
+        "reference_basis": RADAR_SOURCE_REFERENCE,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
         "providers": [
             {
                 "id": template["id"],
@@ -1324,26 +1705,48 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
     client = session()
     if os.path.exists(RADAR_DIR):
         shutil.rmtree(RADAR_DIR)
+    if os.path.exists(RADAR_VECTOR_DIR):
+        shutil.rmtree(RADAR_VECTOR_DIR)
     os.makedirs(RADAR_DIR, exist_ok=True)
+    os.makedirs(RADAR_VECTOR_DIR, exist_ok=True)
     os.makedirs(LAYER_DIR, exist_ok=True)
 
     results: List[Dict[str, Any]] = []
     result_ids = set()
+    mrms_available = False
     try:
-        result = generate_tiles(fetch_us_iem_nexrad(client))
+        result = generate_tiles(fetch_mrms_precip_rate(client))
         results.append(result)
         result_ids.add(result["id"])
+        mrms_available = True
     except Exception as exc:
         result = provider_error(
-            "radar_us_iem_nexrad",
-            "US NEXRAD Reflectivity",
-            "United States",
-            IEM_N0Q_DOCS_URL,
-            "Iowa Environmental Mesonet / NOAA NEXRAD",
+            "radar_north_america_mrms",
+            "North America MRMS Rain Rate",
+            "North America",
+            MRMS_DOCS_URL,
+            "NOAA MRMS / AWS Open Data",
             exc,
         )
         results.append(result)
         result_ids.add(result["id"])
+
+    if not mrms_available:
+        try:
+            result = generate_tiles(fetch_us_iem_nexrad(client))
+            results.append(result)
+            result_ids.add(result["id"])
+        except Exception as exc:
+            result = provider_error(
+                "radar_us_iem_nexrad",
+                "US NEXRAD Rain Rate",
+                "United States",
+                IEM_N0Q_DOCS_URL,
+                "Iowa Environmental Mesonet / NOAA NEXRAD",
+                exc,
+            )
+            results.append(result)
+            result_ids.add(result["id"])
 
     try:
         result = generate_tiles(fetch_canada_geomet_radar(client))
@@ -1385,7 +1788,7 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             "radar_configured_providers",
             "Configured Radar Providers",
             "Configured regions",
-            RAINVIEWER_SOURCES_URL,
+            RADAR_SOURCE_REFERENCE,
             "Configured radar providers",
             exc,
         )
@@ -1403,7 +1806,7 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
                 provider_id,
                 spec.get("name", provider_id),
                 spec.get("region", "Configured radar"),
-                spec.get("source_url", RAINVIEWER_SOURCES_URL),
+                spec.get("source_url", RADAR_SOURCE_REFERENCE),
                 spec.get("attribution", provider_id),
                 exc,
             )
@@ -1437,13 +1840,18 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
     manifest = {
         "generated_at": now_iso(),
         "layers_file": "layers/radar_layers.json",
-        "source_attribution": RAINVIEWER_SOURCES_URL,
+        "vector_layers_file": "layers/radar_vector_layers.json",
+        "reference_basis": RADAR_SOURCE_REFERENCE,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
+        "recommended_color_stops": RADAR_COLOR_STOPS,
         "configured_provider_count": len(configured_specs),
         "providers": results,
     }
     write_json(os.path.join(RADAR_DIR, "manifest.json"), manifest)
     write_json(os.path.join(RADAR_DIR, "provider_catalog.json"), provider_catalog())
     write_json(os.path.join(LAYER_DIR, "radar_layers.json"), layer_entries(results))
+    write_json(os.path.join(LAYER_DIR, "radar_vector_layers.json"), vector_layer_entries(results))
     if print_summary:
         print(json.dumps(manifest, indent=2))
     return manifest

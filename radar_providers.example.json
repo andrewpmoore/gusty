@@ -30,22 +30,22 @@
     },
     {
       "id": "radar_example_image",
-      "name": "Example Paletted Image Radar",
+      "name": "Example Rain Rate Image Radar",
       "region": "Example Region",
       "image_url": "https://example.invalid/radar/latest.png",
       "bounds": [-125.0, 24.0, -66.0, 50.0],
-      "units": "dBZ",
+      "units": "mm/h",
       "attribution": "Example radar provider",
       "source_url": "https://example.invalid/radar",
       "index_values": {
         "1": 0.0,
-        "65": 5.0,
-        "85": 15.0,
-        "105": 25.0,
-        "125": 35.0,
-        "145": 45.0,
-        "165": 55.0,
-        "185": 65.0
+        "65": 0.5,
+        "85": 1.0,
+        "105": 4.0,
+        "125": 8.0,
+        "145": 16.0,
+        "165": 32.0,
+        "185": 64.0
       }
     }
   ]

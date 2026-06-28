@@ -34,7 +34,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python Libraries
-        run: pip install requests numpy pillow
+        run: pip install -r requirements.txt
 
       - name: Fetch Radar Data
         env:
@@ -48,6 +48,7 @@ jobs:
           UK_RADAR_ATTRIBUTION: ${{ vars.UK_RADAR_ATTRIBUTION }}
           RADAR_PROVIDERS_JSON: ${{ vars.RADAR_PROVIDERS_JSON }}
           RADAR_TARGET_DEGREES: ${{ vars.RADAR_TARGET_DEGREES }}
+          MRMS_TARGET_DEGREES: ${{ vars.MRMS_TARGET_DEGREES }}
           RADAR_MIN_VALUE: ${{ vars.RADAR_MIN_VALUE }}
         run: python fetch_radar_data.py --print-summary
 
@@ -71,9 +72,11 @@ jobs:
           fi
 
           mkdir -p layers
-          rm -rf radar
+          rm -rf radar radar_vectors
           cp -a ../public/data/radar ./radar
+          cp -a ../public/data/radar_vectors ./radar_vectors
           cp -a ../public/data/layers/radar_layers.json ./layers/radar_layers.json
+          cp -a ../public/data/layers/radar_vector_layers.json ./layers/radar_vector_layers.json
           git add .
           git commit --allow-empty -m "Latest Radar Data: $(date -u)"
           for attempt in 1 2 3; do
