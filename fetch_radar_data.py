@@ -348,6 +348,8 @@ REGION_BOUNDS = {
     "Thailand": [97.3, 5.5, 105.8, 20.6],
     "Trinidad and Tobago": [-62.1, 10.0, -60.3, 11.5],
     "Turkey": [25.5, 35.6, 45.0, 42.3],
+    "South America": [-92.0, -56.0, -28.0, 15.0],
+    "Asia": [65.0, -10.0, 145.0, 45.0],
     "United Kingdom": [-8.7, 49.8, 2.0, 60.9],
     "United States": [-126.0, 24.0, -66.0, 50.0],
     "Venezuela": [-73.4, 0.5, -59.7, 12.8],
@@ -1600,6 +1602,78 @@ def fetch_opera_cirrus_radar(client: requests.Session) -> RadarGrid:
     )
 
 
+def fetch_australia_bom_radar(client: requests.Session) -> Optional[RadarGrid]:
+    from ftplib import FTP
+    try:
+        ftp = FTP("ftp.bom.gov.au")
+        ftp.login()
+        ftp.set_pasv(True)
+        ftp.cwd("/anon/gen/radar")
+        files = ftp.nlst()
+        matching = sorted([f for f in files if f.startswith("IDR00004") and f.endswith(".png")])
+        if not matching:
+            ftp.quit()
+            return None
+        latest_filename = matching[-1]
+        
+        # Extract timestamp from filename e.g. IDR00004.T.202606291338.png -> 202606291338
+        ts_part = latest_filename.split(".")[-2][1:]
+        ref_time = dt.datetime.strptime(ts_part, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc).isoformat()
+        
+        bio = io.BytesIO()
+        ftp.retrbinary(f"RETR {latest_filename}", bio.write)
+        ftp.quit()
+        image_bytes = bio.getvalue()
+    except Exception as exc:
+        print(f"Failed to fetch BoM FTP radar: {exc}")
+        return None
+
+    # Standard BoM National Mosaic palette mapping to mm/h
+    bom_palette = [
+        (0.1, "#f5f5ff"),
+        (0.5, "#b4b4ff"),
+        (1.0, "#7878ff"),
+        (2.0, "#1414ff"),
+        (4.0, "#ffff00"),
+        (8.0, "#00d8c3"),
+        (16.0, "#009690"),
+        (32.0, "#006666"),
+        (64.0, "#ffc800"),
+        (100.0, "#ff9600"),
+        (125.0, "#ff6400"),
+        (150.0, "#ff0000"),
+        (200.0, "#c80000"),
+        (250.0, "#780000"),
+    ]
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        values = rgba_to_threshold_ramp_values(image, bom_palette, max_color_distance=200)
+
+    bounds = REGION_BOUNDS["Australia"]
+    west, south, east, north = bounds
+
+    height, width = values.shape
+    x_pixel_size = (east - west) / max(width - 1, 1)
+    y_pixel_size = (south - north) / max(height - 1, 1)
+
+    values, latitudes, longitudes = sample_grid(values, x_pixel_size, y_pixel_size, west, north)
+
+    return RadarGrid(
+        provider_id="radar_australia_bom",
+        name="Australia BoM Radar",
+        values=values,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        ref_time=ref_time,
+        source_url="ftp://ftp.bom.gov.au/anon/gen/radar/",
+        attribution="Bureau of Meteorology Australia",
+        region="Australia",
+        units="mm/h",
+        source_units="dbz",
+        source_parameter="reflectivity",
+    )
+
+
 def fetch_jma_nowcast(client: requests.Session) -> RadarGrid:
     response = client.get(JMA_NOWCAST_TIMES_URL, timeout=TIMEOUT)
     response.raise_for_status()
@@ -1855,31 +1929,32 @@ def bilinear_interpolate_coords(src_lat: np.ndarray, src_lon: np.ndarray, src_va
     src_lat_indices = np.arange(len(src_lat))
     src_lon_indices = np.arange(len(src_lon))
 
-    # Map target coordinates to fractional indices in source grid
+    # Map target coordinates to fractional indices in source grid (orthogonal/independent 1D projections)
     lat_idx_frac = np.interp(target_lats_overlap, src_lat, src_lat_indices)
     lon_idx_frac = np.interp(target_lons_overlap, src_lon, src_lon_indices)
 
-    # Mesh grid of fractional coordinates
-    lon_grid, lat_grid = np.meshgrid(lon_idx_frac, lat_idx_frac)
-
-    # Coordinate bounding indices
-    x0 = np.floor(lon_grid).astype(np.int32)
-    x1 = np.minimum(x0 + 1, len(src_lon) - 1)
-    y0 = np.floor(lat_grid).astype(np.int32)
+    # Floor indices and weights in 1D for Y/Latitude
+    y0 = np.floor(lat_idx_frac).astype(np.int32)
     y1 = np.minimum(y0 + 1, len(src_lat) - 1)
+    wy = (lat_idx_frac - y0)[:, None]  # Broadcast column: (len_y, 1)
 
-    # Bilinear interpolation weights
-    wa = (x1 - lon_grid) * (y1 - lat_grid)
-    wb = (lon_grid - x0) * (y1 - lat_grid)
-    wc = (x1 - lon_grid) * (lat_grid - y0)
-    wd = (lon_grid - x0) * (lat_grid - y0)
+    # Floor indices and weights in 1D for X/Longitude
+    x0 = np.floor(lon_idx_frac).astype(np.int32)
+    x1 = np.minimum(x0 + 1, len(src_lon) - 1)
+    wx = (lon_idx_frac - x0)[None, :]  # Broadcast row: (1, len_x)
 
-    # Interpolate overlapping area
+    # Extract 2D sub-grids using 1D structured indexing (np.ix_ is extremely fast)
+    c00 = src_values[np.ix_(y0, x0)]
+    c01 = src_values[np.ix_(y0, x1)]
+    c10 = src_values[np.ix_(y1, x0)]
+    c11 = src_values[np.ix_(y1, x1)]
+
+    # Interpolate using 2D broadcasting
     interpolated = (
-        src_values[y0, x0] * wa +
-        src_values[y0, x1] * wb +
-        src_values[y1, x0] * wc +
-        src_values[y1, x1] * wd
+        c00 * (1.0 - wy) * (1.0 - wx) +
+        c01 * (1.0 - wy) * wx +
+        c10 * wy * (1.0 - wx) +
+        c11 * wy * wx
     )
 
     output[np.ix_(lat_mask, lon_mask)] = np.where(np.isnan(interpolated), fill_value, interpolated)
@@ -2050,14 +2125,20 @@ def generate_scalar_precip_tiles(
     grid_bounds_list = [(grid, grid_bounds(grid)) for grid in active_grids]
     tile_origins = set()
 
-    # Limit tiles to observation regions since GFS is global and generating tiles globally is too slow
-    for grid, bounds in grid_bounds_list:
-        west, south, east, north = bounds
-        for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-            for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-                if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
-                    continue
+    if has_gfs:
+        # Generate tiles globally since GFS global fallback is active
+        for lat_start in range(-90, 90, TILE_SIZE):
+            for lon_start in range(-180, 180, TILE_SIZE):
                 tile_origins.add((lat_start, lon_start))
+    else:
+        # Limit tiles to active observation regions if GFS is not available
+        for grid, bounds in grid_bounds_list:
+            west, south, east, north = bounds
+            for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                    if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
+                        continue
+                    tile_origins.add((lat_start, lon_start))
 
     pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes, int, int]]] = {}
     tile_count = 0
@@ -2084,19 +2165,30 @@ def generate_scalar_precip_tiles(
             for grid in overlapping_obs:
                 obs_values = np.maximum(obs_values, resample_grid_values(grid, lat_vals, lon_vals))
 
-        # B. GFS low/high
+        # B. GFS low/high (resample if GFS is available to enable global fallback)
         gfs_low = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-        if blend_obs_factor < 1.0 and gfs_grid_low is not None:
+        if (blend_obs_factor < 1.0 or has_gfs) and gfs_grid_low is not None:
             gfs_low = resample_grid_values(gfs_grid_low, lat_vals, lon_vals)
 
         gfs_high = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-        if blend_obs_factor < 1.0 and gfs_grid_high is not None:
+        if (blend_obs_factor < 1.0 or has_gfs) and gfs_grid_high is not None:
             gfs_high = resample_grid_values(gfs_grid_high, lat_vals, lon_vals)
 
         gfs_val = (1.0 - alpha) * gfs_low + alpha * gfs_high
 
         # C. Blend Observations and GFS
-        merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
+        if blend_obs_factor == 1.0 and has_gfs:
+            # At offset 0, use observations where covered by any radar, otherwise fall back to GFS
+            obs_covered_mask = np.zeros((len(lat_vals), len(lon_vals)), dtype=bool)
+            if overlapping_obs:
+                for grid in overlapping_obs:
+                    grid_west, grid_south, grid_east, grid_north = grid_bounds(grid)
+                    lat_in = (lat_vals[:, None] >= grid_south) & (lat_vals[:, None] <= grid_north)
+                    lon_in = (lon_vals[None, :] >= grid_west) & (lon_vals[None, :] <= grid_east)
+                    obs_covered_mask |= (lat_in & lon_in)
+            merged_values = np.where(obs_covered_mask, obs_values, gfs_val)
+        else:
+            merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
         merged_values = filter_radar_noise(merged_values)
 
         # D. Wet-bulb (snow/mixed precipitation typing)
@@ -2151,16 +2243,26 @@ def generate_scalar_precip_tiles(
                     obs_values = np.maximum(obs_values, resample_grid_values(grid, lat_vals, lon_vals))
 
             gfs_low = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-            if blend_obs_factor < 1.0 and gfs_grid_low is not None:
+            if (blend_obs_factor < 1.0 or has_gfs) and gfs_grid_low is not None:
                 gfs_low = resample_grid_values(gfs_grid_low, lat_vals, lon_vals)
 
             gfs_high = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-            if blend_obs_factor < 1.0 and gfs_grid_high is not None:
+            if (blend_obs_factor < 1.0 or has_gfs) and gfs_grid_high is not None:
                 gfs_high = resample_grid_values(gfs_grid_high, lat_vals, lon_vals)
 
             gfs_val = (1.0 - alpha) * gfs_low + alpha * gfs_high
 
-            merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
+            if blend_obs_factor == 1.0 and has_gfs:
+                obs_covered_mask = np.zeros((len(lat_vals), len(lon_vals)), dtype=bool)
+                if overlapping_obs:
+                    for grid in overlapping_obs:
+                        grid_west, grid_south, grid_east, grid_north = grid_bounds(grid)
+                        lat_in = (lat_vals[:, None] >= grid_south) & (lat_vals[:, None] <= grid_north)
+                        lon_in = (lon_vals[None, :] >= grid_west) & (lon_vals[None, :] <= grid_east)
+                        obs_covered_mask |= (lat_in & lon_in)
+                merged_values = np.where(obs_covered_mask, obs_values, gfs_val)
+            else:
+                merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
             merged_values = filter_radar_noise(merged_values)
 
             wb_low = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
@@ -2614,6 +2716,25 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         result_ids.add(result["id"])
 
     try:
+        grid = fetch_australia_bom_radar(client)
+        if grid:
+            result = generate_tiles(grid)
+            results.append(result)
+            active_grids.append(grid)
+            result_ids.add(result["id"])
+    except Exception as exc:
+        result = provider_error(
+            "radar_australia_bom",
+            "Australia BoM Radar",
+            "Australia",
+            "ftp://ftp.bom.gov.au/anon/gen/radar/",
+            "Bureau of Meteorology Australia",
+            exc,
+        )
+        results.append(result)
+        result_ids.add(result["id"])
+
+    try:
         grid = fetch_jma_nowcast(client)
         result = generate_tiles(grid)
         results.append(result)
@@ -2691,10 +2812,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             results.append(result)
             result_ids.add(result["id"])
 
-    # 1. Fetch GFS forecast grids (wet-bulb temperature and precip rate) for f000, f003, f006
+    # 1. Fetch only current GFS grids while iterating on radar ingest speed.
     gfs_grids = {}
     gfs_errors = {}
-    for h in (0, 3, 6):
+    for h in (0,):
         try:
             gfs_grids[h] = fetch_gfs_forecast_grids(client, h)
         except Exception as exc:
@@ -2704,8 +2825,8 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
     precip_type_grid = gfs_grids[0][1] if 0 in gfs_grids else None
     precip_type_error = gfs_errors.get(0)
 
-    # 2. Generate tiles for all 10-minute forecast offsets (0 to 240 mins)
-    offsets = [i * 10 for i in range(25)] # 0, 10, ..., 240 mins
+    # 2. Generate only the current tiles while iterating on radar ingest speed.
+    offsets = [0]
 
     # Store the results for offset 0 to return in the manifest
     scalar_results = []
