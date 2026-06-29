@@ -72,9 +72,10 @@ jobs:
           fi
 
           mkdir -p layers
-          rm -rf radar radar_vectors
+          rm -rf radar radar_vectors radar_rain_rate
           cp -a ../public/data/radar ./radar
           cp -a ../public/data/radar_vectors ./radar_vectors
+          cp -a ../public/data/radar_rain_rate ./radar_rain_rate
           cp -a ../public/data/layers/radar_layers.json ./layers/radar_layers.json
           cp -a ../public/data/layers/radar_vector_layers.json ./layers/radar_vector_layers.json
           git add .

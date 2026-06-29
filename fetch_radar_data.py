@@ -23,6 +23,8 @@ from PIL import Image
 OUTPUT_DIR = "public/data"
 RADAR_DIR = os.path.join(OUTPUT_DIR, "radar")
 RADAR_VECTOR_DIR = os.path.join(OUTPUT_DIR, "radar_vectors")
+RADAR_RAIN_RATE_ID = "radar_rain_rate"
+RADAR_RAIN_RATE_DIR = os.path.join(OUTPUT_DIR, RADAR_RAIN_RATE_ID)
 LAYER_DIR = os.path.join(OUTPUT_DIR, "layers")
 TIMEOUT = 90
 USER_AGENT = os.getenv(
@@ -664,6 +666,13 @@ def clean_vector_provider_dir(provider_id: str) -> str:
         shutil.rmtree(provider_dir)
     os.makedirs(provider_dir, exist_ok=True)
     return provider_dir
+
+
+def clean_rain_rate_dir() -> str:
+    if os.path.exists(RADAR_RAIN_RATE_DIR):
+        shutil.rmtree(RADAR_RAIN_RATE_DIR)
+    os.makedirs(RADAR_RAIN_RATE_DIR, exist_ok=True)
+    return RADAR_RAIN_RATE_DIR
 
 
 def coordinate_label(lat_start: int, lon_start: int) -> Tuple[str, str]:
@@ -1544,19 +1553,224 @@ def tile_range(values: Iterable[float], tile_size: int) -> range:
     return range(start, end + tile_size, tile_size)
 
 
+def max_pool(values: np.ndarray, step: int) -> np.ndarray:
+    rows = math.ceil(values.shape[0] / step)
+    cols = math.ceil(values.shape[1] / step)
+    pooled = np.zeros((rows, cols), dtype=np.float32)
+    for row in range(rows):
+        row_start = row * step
+        row_end = min(row_start + step, values.shape[0])
+        for col in range(cols):
+            col_start = col * step
+            col_end = min(col_start + step, values.shape[1])
+            pooled[row, col] = float(np.nanmax(values[row_start:row_end, col_start:col_end]))
+    return pooled
+
+
 def build_overview_tile(
     lon_vals: np.ndarray,
     lat_vals: np.ndarray,
     values: np.ndarray,
 ) -> Optional[bytes]:
-    overview_values = values[::OVERVIEW_SAMPLE_STEP, ::OVERVIEW_SAMPLE_STEP]
     overview_lat = lat_vals[::OVERVIEW_SAMPLE_STEP]
     overview_lon = lon_vals[::OVERVIEW_SAMPLE_STEP]
+    overview_values = max_pool(values, OVERVIEW_SAMPLE_STEP)
+    overview_values = overview_values[: len(overview_lat), : len(overview_lon)]
     if overview_values.size == 0 or overview_lat.size == 0 or overview_lon.size == 0:
         return None
     dy = (overview_lat[-1] - overview_lat[0]) / (len(overview_lat) - 1) if len(overview_lat) > 1 else 1.0
     dx = (overview_lon[-1] - overview_lon[0]) / (len(overview_lon) - 1) if len(overview_lon) > 1 else 1.0
     return build_binary_tile_bytes(overview_lon, overview_lat, dx, dy, overview_values)
+
+
+def nearest_indices(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    if len(source) == 1:
+        return np.zeros(len(target), dtype=np.int64)
+    positions = np.searchsorted(source, target)
+    positions = np.clip(positions, 1, len(source) - 1)
+    left = source[positions - 1]
+    right = source[positions]
+    return np.where(np.abs(target - left) <= np.abs(right - target), positions - 1, positions)
+
+
+def resample_grid_values(grid: RadarGrid, lat_vals: np.ndarray, lon_vals: np.ndarray) -> np.ndarray:
+    src_lat = np.asarray(grid.latitudes, dtype=np.float64)
+    src_lon = np.asarray(grid.longitudes, dtype=np.float64)
+    src_values = np.asarray(grid.values, dtype=np.float32)
+    if src_lat[0] > src_lat[-1]:
+        src_lat = src_lat[::-1]
+        src_values = src_values[::-1, :]
+    if src_lon[0] > src_lon[-1]:
+        src_lon = src_lon[::-1]
+        src_values = src_values[:, ::-1]
+
+    output = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+    lat_mask = (lat_vals >= src_lat[0]) & (lat_vals <= src_lat[-1])
+    lon_mask = (lon_vals >= src_lon[0]) & (lon_vals <= src_lon[-1])
+    if not np.any(lat_mask) or not np.any(lon_mask):
+        return output
+
+    lat_indices = nearest_indices(src_lat, lat_vals[lat_mask])
+    lon_indices = nearest_indices(src_lon, lon_vals[lon_mask])
+    output[np.ix_(lat_mask, lon_mask)] = src_values[np.ix_(lat_indices, lon_indices)]
+    return output
+
+
+def grid_bounds(grid: RadarGrid) -> Tuple[float, float, float, float]:
+    return (
+        float(np.nanmin(grid.longitudes)),
+        float(np.nanmin(grid.latitudes)),
+        float(np.nanmax(grid.longitudes)),
+        float(np.nanmax(grid.latitudes)),
+    )
+
+
+def intersects_bounds(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+    west_a, south_a, east_a, north_a = a
+    west_b, south_b, east_b, north_b = b
+    return west_a <= east_b and east_a >= west_b and south_a <= north_b and north_a >= south_b
+
+
+def tile_axis(start: float, end: float, step: float, descending: bool = False) -> np.ndarray:
+    if descending:
+        values = np.arange(end, start - step * 0.5, -step, dtype=np.float64)
+        return values[(values >= start) & (values <= end)]
+    values = np.arange(start, end + step * 0.5, step, dtype=np.float64)
+    return values[(values >= start) & (values <= end)]
+
+
+def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
+    active_grids = [grid for grid in grids if grid.values.size and float(np.nanmax(grid.values)) > 0]
+    rain_rate_dir = clean_rain_rate_dir()
+    if not active_grids:
+        return {
+            "id": RADAR_RAIN_RATE_ID,
+            "name": "Radar Rain Rate",
+            "status": "configuration_required",
+            "region": "Global available radar coverage",
+            "bounds": [-180.0, -90.0, 180.0, 90.0],
+            "tiles": 0,
+            "packs": 0,
+            "max_value": 0,
+            "units": RADAR_VALUE_UNITS,
+            "value_parameter": RADAR_VALUE_PARAMETER,
+            "value_units": RADAR_VALUE_UNITS,
+            "path": RADAR_RAIN_RATE_ID,
+            "attribution": None,
+            "source_url": RADAR_SOURCE_REFERENCE,
+            "tile_format": TILE_FORMAT,
+            "pack_format": PACK_FORMAT,
+            "metadata": {
+                "parameter": RADAR_VALUE_PARAMETER,
+                "units": RADAR_VALUE_UNITS,
+                "client_coloring": True,
+                "recommended_color_stops": RADAR_COLOR_STOPS,
+                "overview_reduction": "max",
+            },
+        }
+
+    grid_bounds_list = [(grid, grid_bounds(grid)) for grid in active_grids]
+    tile_origins = set()
+    for _, bounds in grid_bounds_list:
+        west, south, east, north = bounds
+        for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+            for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
+                    continue
+                tile_origins.add((lat_start, lon_start))
+
+    pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes, int, int]]] = {}
+    tile_count = 0
+    max_value = 0.0
+    for lat_start, lon_start in sorted(tile_origins):
+        lat_end = min(lat_start + TILE_SIZE, 90)
+        lon_end = min(lon_start + TILE_SIZE, 180)
+        tile_bounds = (float(lon_start), float(lat_start), float(lon_end), float(lat_end))
+        overlapping = [
+            grid
+            for grid, bounds in grid_bounds_list
+            if intersects_bounds(tile_bounds, bounds)
+        ]
+        if not overlapping:
+            continue
+
+        lat_vals = tile_axis(float(lat_start), float(lat_end), RADAR_TARGET_DEGREES, descending=True)
+        lon_vals = tile_axis(float(lon_start), float(lon_end), RADAR_TARGET_DEGREES)
+        if len(lat_vals) == 0 or len(lon_vals) == 0:
+            continue
+
+        merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+        for grid in overlapping:
+            merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+        if float(np.nanmax(merged_values)) <= 0:
+            continue
+
+        dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else -RADAR_TARGET_DEGREES
+        dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else RADAR_TARGET_DEGREES
+        tile_bytes = build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, merged_values)
+        pack_start = pack_origin(lat_start, lon_start)
+        pack_entries.setdefault(pack_start, []).append(
+            (tile_key(lat_start, lon_start), tile_bytes, lat_start, lon_start)
+        )
+        tile_count += 1
+        max_value = max(max_value, float(np.nanmax(merged_values)))
+
+    pack_count = 0
+    for (pack_lat_start, pack_lon_start), pack_tiles in pack_entries.items():
+        entries = [(key, tile_bytes) for key, tile_bytes, _, _ in pack_tiles]
+        pack_lat_end = min(pack_lat_start + PACK_LAT_SIZE, 90)
+        pack_lon_end = min(pack_lon_start + PACK_LON_SIZE, 180)
+        pack_bounds = (float(pack_lon_start), float(pack_lat_start), float(pack_lon_end), float(pack_lat_end))
+        overlapping = [
+            grid
+            for grid, bounds in grid_bounds_list
+            if intersects_bounds(pack_bounds, bounds)
+        ]
+        if overlapping:
+            lat_vals = tile_axis(float(pack_lat_start), float(pack_lat_end), RADAR_TARGET_DEGREES, descending=True)
+            lon_vals = tile_axis(float(pack_lon_start), float(pack_lon_end), RADAR_TARGET_DEGREES)
+            merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+            for grid in overlapping:
+                merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+            overview_tile = build_overview_tile(lon_vals, lat_vals, merged_values)
+            if overview_tile:
+                entries.append((overview_tile_key(pack_lat_start, pack_lon_start), overview_tile))
+        pack_path = os.path.join(rain_rate_dir, pack_filename(RADAR_RAIN_RATE_ID, 0, pack_lat_start, pack_lon_start))
+        write_tile_pack(pack_path, entries)
+        pack_count += 1
+
+    ref_times = [grid.ref_time for grid in active_grids if grid.ref_time]
+    attributions = sorted({grid.attribution for grid in active_grids if grid.attribution})
+    return {
+        "id": RADAR_RAIN_RATE_ID,
+        "name": "Radar Rain Rate",
+        "status": "ok" if tile_count else "configuration_required",
+        "region": "Global available radar coverage",
+        "bounds": [-180.0, -90.0, 180.0, 90.0],
+        "ref_time": max(ref_times) if ref_times else None,
+        "tiles": tile_count,
+        "packs": pack_count,
+        "max_value": round(max_value, 1),
+        "units": RADAR_VALUE_UNITS,
+        "value_parameter": RADAR_VALUE_PARAMETER,
+        "value_units": RADAR_VALUE_UNITS,
+        "path": RADAR_RAIN_RATE_ID,
+        "attribution": " / ".join(attributions) if attributions else None,
+        "source_url": RADAR_SOURCE_REFERENCE,
+        "provider_url": RADAR_SOURCE_REFERENCE,
+        "tile_format": TILE_FORMAT,
+        "pack_format": PACK_FORMAT,
+        "metadata": {
+            "parameter": RADAR_VALUE_PARAMETER,
+            "units": RADAR_VALUE_UNITS,
+            "value_range": [0, max(1, round(max_value, 1))],
+            "target_degrees": RADAR_TARGET_DEGREES,
+            "client_coloring": True,
+            "recommended_color_stops": RADAR_COLOR_STOPS,
+            "overview_reduction": "max",
+            "source_provider_ids": [grid.provider_id for grid in active_grids],
+        },
+    }
 
 
 def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
@@ -1809,6 +2023,7 @@ def vector_layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, An
                 "vector_pack_format": result.get("vector_pack_format", VECTOR_PACK_FORMAT),
             }
             for result in provider_results
+            if result.get("vector_path")
         ],
     }
 
@@ -1843,16 +2058,22 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         shutil.rmtree(RADAR_DIR)
     if os.path.exists(RADAR_VECTOR_DIR):
         shutil.rmtree(RADAR_VECTOR_DIR)
+    if os.path.exists(RADAR_RAIN_RATE_DIR):
+        shutil.rmtree(RADAR_RAIN_RATE_DIR)
     os.makedirs(RADAR_DIR, exist_ok=True)
     os.makedirs(RADAR_VECTOR_DIR, exist_ok=True)
+    os.makedirs(RADAR_RAIN_RATE_DIR, exist_ok=True)
     os.makedirs(LAYER_DIR, exist_ok=True)
 
     results: List[Dict[str, Any]] = []
+    active_grids: List[RadarGrid] = []
     result_ids = set()
     mrms_available = False
     try:
-        result = generate_tiles(fetch_mrms_precip_rate(client))
+        grid = fetch_mrms_precip_rate(client)
+        result = generate_tiles(grid)
         results.append(result)
+        active_grids.append(grid)
         result_ids.add(result["id"])
         mrms_available = True
     except Exception as exc:
@@ -1869,8 +2090,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
 
     if not mrms_available:
         try:
-            result = generate_tiles(fetch_us_iem_nexrad(client))
+            grid = fetch_us_iem_nexrad(client)
+            result = generate_tiles(grid)
             results.append(result)
+            active_grids.append(grid)
             result_ids.add(result["id"])
         except Exception as exc:
             result = provider_error(
@@ -1885,8 +2108,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             result_ids.add(result["id"])
 
     try:
-        result = generate_tiles(fetch_canada_geomet_radar(client))
+        grid = fetch_canada_geomet_radar(client)
+        result = generate_tiles(grid)
         results.append(result)
+        active_grids.append(grid)
         result_ids.add(result["id"])
     except Exception as exc:
         result = provider_error(
@@ -1901,8 +2126,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         result_ids.add(result["id"])
 
     try:
-        result = generate_tiles(fetch_opera_cirrus_radar(client))
+        grid = fetch_opera_cirrus_radar(client)
+        result = generate_tiles(grid)
         results.append(result)
+        active_grids.append(grid)
         result_ids.add(result["id"])
     except Exception as exc:
         result = provider_error(
@@ -1917,8 +2144,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         result_ids.add(result["id"])
 
     try:
-        result = generate_tiles(fetch_jma_nowcast(client))
+        grid = fetch_jma_nowcast(client)
+        result = generate_tiles(grid)
         results.append(result)
+        active_grids.append(grid)
         result_ids.add(result["id"])
     except Exception as exc:
         result = provider_error(
@@ -1952,7 +2181,9 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         if not provider_id:
             continue
         try:
-            result = generate_tiles(fetch_configured_radar(client, spec))
+            grid = fetch_configured_radar(client, spec)
+            result = generate_tiles(grid)
+            active_grids.append(grid)
         except Exception as exc:
             result = provider_error(
                 provider_id,
@@ -1970,6 +2201,7 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         if uk_grid and uk_grid.provider_id not in result_ids:
             result = generate_tiles(uk_grid)
             results.append(result)
+            active_grids.append(uk_grid)
             result_ids.add(result["id"])
     except Exception as exc:
         result = provider_error(
@@ -1988,6 +2220,10 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             result = configuration_pending_manifest(template)
             results.append(result)
             result_ids.add(result["id"])
+
+    rain_rate_result = generate_rain_rate_tiles(active_grids)
+    results.insert(0, rain_rate_result)
+    result_ids.add(rain_rate_result["id"])
 
     manifest = {
         "generated_at": now_iso(),
