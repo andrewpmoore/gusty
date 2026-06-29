@@ -33,23 +33,29 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libeccodes-dev
+
       - name: Install Python Libraries
         run: pip install -r requirements.txt
 
       - name: Fetch Radar Data
         env:
-          GUSTY_USER_AGENT: "GustyWeather/1.0 (https://gustyweather.com; weather-radar-ingestion)"
-          UK_RADAR_IMAGE_URL: ${{ vars.UK_RADAR_IMAGE_URL }}
-          UK_RADAR_IMAGE_BOUNDS: ${{ vars.UK_RADAR_IMAGE_BOUNDS }}
-          UK_RADAR_INDEX_VALUES: ${{ vars.UK_RADAR_INDEX_VALUES }}
-          UK_RADAR_UNITS: ${{ vars.UK_RADAR_UNITS }}
-          UK_RADAR_REF_TIME: ${{ vars.UK_RADAR_REF_TIME }}
-          UK_RADAR_SOURCE_URL: ${{ vars.UK_RADAR_SOURCE_URL }}
-          UK_RADAR_ATTRIBUTION: ${{ vars.UK_RADAR_ATTRIBUTION }}
+          GUSTY_USER_AGENT: ${{ vars.GUSTY_USER_AGENT || 'GustyWeather/1.0 (https://gustyweather.com; weather-radar-ingestion)' }}
           RADAR_PROVIDERS_JSON: ${{ vars.RADAR_PROVIDERS_JSON }}
           RADAR_TARGET_DEGREES: ${{ vars.RADAR_TARGET_DEGREES }}
-          MRMS_TARGET_DEGREES: ${{ vars.MRMS_TARGET_DEGREES }}
           RADAR_MIN_VALUE: ${{ vars.RADAR_MIN_VALUE }}
+          RADAR_NOISE_FLOOR_MM_H: ${{ vars.RADAR_NOISE_FLOOR_MM_H }}
+          RADAR_EDGE_THRESHOLD_MM_H: ${{ vars.RADAR_EDGE_THRESHOLD_MM_H }}
+          RADAR_ENABLE_GLOBAL_MODEL_FALLBACK: ${{ vars.RADAR_ENABLE_GLOBAL_MODEL_FALLBACK }}
+          METOFFICE_DATAHUB_API_KEY: ${{ secrets.METOFFICE_DATAHUB_API_KEY }}
+          AEMET_API_KEY: ${{ secrets.AEMET_API_KEY }}
+          METEOFRANCE_API_KEY: ${{ secrets.METEOFRANCE_API_KEY }}
+          CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
+          EUMETSAT_CONSUMER_KEY: ${{ secrets.EUMETSAT_CONSUMER_KEY }}
+          EUMETSAT_CONSUMER_SECRET: ${{ secrets.EUMETSAT_CONSUMER_SECRET }}
         run: python fetch_radar_data.py --print-summary
 
       - name: Deploy Radar Data
