@@ -11,6 +11,26 @@ import fetch_radar_data as radar
 
 
 class FetchRadarDataCoreTests(unittest.TestCase):
+    def _model_frame(self, lead_minutes, value):
+        latitudes = np.array([1.0, 0.0], dtype=np.float64)
+        longitudes = np.array([0.0, 1.0], dtype=np.float64)
+        values = np.full((2, 2), value, dtype=np.float32)
+        return radar.create_frame(
+            provider_id="noaa_gfs",
+            name="Fixture GFS",
+            valid_time="2026-06-29T00:00:00+00:00",
+            lead_minutes=lead_minutes,
+            latitudes=latitudes,
+            longitudes=longitudes,
+            rain=values,
+            snow=values * 0.5,
+            mixed=None,
+            attribution="Fixture",
+            source_url="https://example.com",
+            source_kind="model-grib2",
+            metadata={"model_fallback": True},
+        )
+
     def test_split_precip_by_wet_bulb(self):
         precip = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
         wet_bulb = np.array([[-1.0, 0.8, 3.0]], dtype=np.float32)
@@ -72,6 +92,23 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         for product in products:
             self.assertEqual(product["forecast_offsets_minutes"], radar.FORECAST_OFFSETS_MINUTES)
             self.assertEqual(len(product["frames"]), len(radar.FORECAST_OFFSETS_MINUTES))
+
+    def test_global_model_fallback_is_enabled_by_default(self):
+        far_from_observations = (20.0, -20.0, 40.0, 0.0)
+
+        self.assertTrue(radar.ENABLE_GLOBAL_MODEL_FALLBACK)
+        self.assertTrue(radar.tile_has_model_permission(far_from_observations, []))
+
+    def test_gfs_interpolation_uses_hourly_frames_for_display_offsets(self):
+        low = self._model_frame(60, 2.0)
+        high = self._model_frame(120, 6.0)
+
+        frame = radar.select_or_interpolate_gfs_frame([low, high], 90)
+
+        self.assertEqual(frame.lead_minutes, 90)
+        np.testing.assert_allclose(frame.rain_mm_h, np.full((2, 2), 4.0))
+        np.testing.assert_allclose(frame.snow_mm_h, np.full((2, 2), 2.0))
+        self.assertEqual(frame.metadata["interpolated_from_minutes"], [60, 120])
 
 
 if __name__ == "__main__":

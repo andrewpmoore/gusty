@@ -42,6 +42,13 @@ RADAR_SOURCE_REFERENCE = "official and public meteorological radar provider refe
 RADAR_VALUE_PARAMETER = "rain_rate"
 RADAR_VALUE_UNITS = "mm/h"
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 TIMEOUT = int(os.getenv("RADAR_HTTP_TIMEOUT", "90"))
 USER_AGENT = os.getenv(
     "GUSTY_USER_AGENT",
@@ -58,11 +65,12 @@ RADAR_SMOOTHING_PASSES = int(os.getenv("RADAR_SMOOTHING_PASSES", "2") or "2")
 RADAR_DILATION_PASSES = int(os.getenv("RADAR_DILATION_PASSES", "1") or "1")
 PERSISTENCE_END_MINUTES = int(os.getenv("RADAR_PERSISTENCE_END_MINUTES", "135") or "135")
 MODEL_BLEND_START_MINUTES = int(os.getenv("RADAR_MODEL_BLEND_START_MINUTES", "45") or "45")
-ENABLE_GLOBAL_MODEL_FALLBACK = os.getenv("RADAR_ENABLE_GLOBAL_MODEL_FALLBACK", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+ENABLE_GLOBAL_MODEL_FALLBACK = env_bool("RADAR_ENABLE_GLOBAL_MODEL_FALLBACK", True)
+NOAA_GFS_FORECAST_HOURS = [
+    int(value.strip())
+    for value in os.getenv("NOAA_GFS_FORECAST_HOURS", "0,1,2").split(",")
+    if value.strip()
+]
 
 PRECIP_TYPE_SNOW_WET_BULB_C = float(os.getenv("RADAR_SNOW_WET_BULB_C", "0.0") or "0.0")
 PRECIP_TYPE_RAIN_WET_BULB_C = float(os.getenv("RADAR_RAIN_WET_BULB_C", "1.5") or "1.5")
@@ -1027,42 +1035,87 @@ def fetch_noaa_gfs_model(client: requests.Session, forecast_hour: int) -> Precip
     raise ValueError(f"No usable GFS f{forecast_hour:03d} frame found: {last_error}")
 
 
+def interpolate_gfs_frame(low: PrecipFrame, high: PrecipFrame, offset_minutes: int) -> PrecipFrame:
+    span = max(1, high.lead_minutes - low.lead_minutes)
+    alpha = min(1.0, max(0.0, (offset_minutes - low.lead_minutes) / span))
+    rain = (1.0 - alpha) * low.rain_mm_h + alpha * high.rain_mm_h
+    snow = None
+    if low.snow_mm_h is not None and high.snow_mm_h is not None:
+        snow = (1.0 - alpha) * low.snow_mm_h + alpha * high.snow_mm_h
+    mixed = None
+    if low.mixed_mm_h is not None and high.mixed_mm_h is not None:
+        mixed = (1.0 - alpha) * low.mixed_mm_h + alpha * high.mixed_mm_h
+    return create_frame(
+        provider_id="noaa_gfs",
+        name="NOAA GFS Short-Range Precipitation Fallback",
+        valid_time=high.valid_time or low.valid_time,
+        lead_minutes=offset_minutes,
+        latitudes=low.latitudes,
+        longitudes=low.longitudes,
+        rain=rain,
+        snow=snow,
+        mixed=mixed,
+        attribution="NOAA GFS / NOMADS",
+        source_url=low.source_url,
+        source_kind="model-grib2-interpolated",
+        metadata={
+            "forecast_offset_minutes": offset_minutes,
+            "model_fallback": True,
+            "interpolated_from_minutes": [low.lead_minutes, high.lead_minutes],
+        },
+    )
+
+
+def select_or_interpolate_gfs_frame(frames: List[PrecipFrame], offset_minutes: int) -> PrecipFrame:
+    sorted_frames = sorted(frames, key=lambda frame: frame.lead_minutes)
+    for frame in sorted_frames:
+        if frame.lead_minutes == offset_minutes:
+            return frame
+
+    lower = [frame for frame in sorted_frames if frame.lead_minutes < offset_minutes]
+    upper = [frame for frame in sorted_frames if frame.lead_minutes > offset_minutes]
+    if lower and upper:
+        return interpolate_gfs_frame(lower[-1], upper[0], offset_minutes)
+
+    source = lower[-1] if lower else sorted_frames[0]
+    return create_frame(
+        provider_id="noaa_gfs",
+        name="NOAA GFS Short-Range Precipitation Fallback",
+        valid_time=source.valid_time,
+        lead_minutes=offset_minutes,
+        latitudes=source.latitudes,
+        longitudes=source.longitudes,
+        rain=source.rain_mm_h,
+        snow=source.snow_mm_h,
+        mixed=source.mixed_mm_h,
+        attribution="NOAA GFS / NOMADS",
+        source_url=source.source_url,
+        source_kind="model-grib2-persistence",
+        metadata={
+            "forecast_offset_minutes": offset_minutes,
+            "model_fallback": True,
+            "persisted_from_minutes": source.lead_minutes,
+        },
+    )
+
+
 def fetch_noaa_gfs_provider(client: requests.Session) -> ProviderResult:
-    frames = [fetch_noaa_gfs_model(client, 0), fetch_noaa_gfs_model(client, 3)]
+    frames = []
+    errors = []
+    for forecast_hour in NOAA_GFS_FORECAST_HOURS:
+        try:
+            frames.append(fetch_noaa_gfs_model(client, forecast_hour))
+        except Exception as exc:
+            errors.append(f"f{forecast_hour:03d}: {exc}")
+    if not frames:
+        raise ValueError("No usable GFS model frames found. " + " | ".join(errors))
+
     interpolated: List[PrecipFrame] = []
-    low, high = frames
     for offset in FORECAST_OFFSETS_MINUTES:
-        alpha = min(1.0, max(0.0, offset / 180.0))
-        if offset == 0:
-            interpolated.append(low)
-            continue
-        if offset == 180:
-            interpolated.append(high)
-            continue
-        rain = (1.0 - alpha) * low.rain_mm_h + alpha * high.rain_mm_h
-        snow = None
-        if low.snow_mm_h is not None and high.snow_mm_h is not None:
-            snow = (1.0 - alpha) * low.snow_mm_h + alpha * high.snow_mm_h
-        mixed = None
-        if low.mixed_mm_h is not None and high.mixed_mm_h is not None:
-            mixed = (1.0 - alpha) * low.mixed_mm_h + alpha * high.mixed_mm_h
-        interpolated.append(
-            create_frame(
-                provider_id="noaa_gfs",
-                name="NOAA GFS Short-Range Precipitation Fallback",
-                valid_time=high.valid_time,
-                lead_minutes=offset,
-                latitudes=low.latitudes,
-                longitudes=low.longitudes,
-                rain=rain,
-                snow=snow,
-                mixed=mixed,
-                attribution="NOAA GFS / NOMADS",
-                source_url=low.source_url,
-                source_kind="model-grib2-interpolated",
-                metadata={"forecast_offset_minutes": offset, "model_fallback": True},
-            )
-        )
+        frame = select_or_interpolate_gfs_frame(frames, offset)
+        frame.metadata["model_fallback"] = True
+        frame.metadata["display_offset_minutes"] = offset
+        interpolated.append(frame)
     return ProviderResult(
         id="noaa_gfs",
         name="NOAA GFS Short-Range Precipitation Fallback",
@@ -1070,7 +1123,12 @@ def fetch_noaa_gfs_provider(client: requests.Session) -> ProviderResult:
         source_url="https://nomads.ncep.noaa.gov/",
         attribution="NOAA GFS / NOMADS",
         frames=interpolated,
-        metadata={"anonymous": True, "model_fallback": True},
+        metadata={
+            "anonymous": True,
+            "model_fallback": True,
+            "forecast_hours_requested": NOAA_GFS_FORECAST_HOURS,
+            "warnings": errors,
+        },
     )
 
 
@@ -1824,10 +1882,15 @@ def provider_catalog() -> Dict[str, Any]:
             {
                 "id": "noaa_gfs",
                 "name": "NOAA GFS short-range model fallback",
-                "coverage": "Global model grid, limited to radar coverage by default",
+                "coverage": "Global model grid",
                 "free": True,
                 "registration_required": False,
                 "source_url": "https://nomads.ncep.noaa.gov/",
+                "metadata": {
+                    "enabled_by_default": ENABLE_GLOBAL_MODEL_FALLBACK,
+                    "forecast_hours_requested": NOAA_GFS_FORECAST_HOURS,
+                    "display_offsets_minutes": FORECAST_OFFSETS_MINUTES,
+                },
             },
             {
                 "id": "dwd_open_data",
@@ -1904,9 +1967,19 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             "replacement": True,
             "transparent_zero": True,
             "forecast_window_minutes": [0, 120],
+            "display_offsets_minutes": FORECAST_OFFSETS_MINUTES,
             "quality_goal": "smooth transparent rain/snow fields comparable to Rainbow.ai map overlays",
             "provider_failure_policy": "provider failures are warnings unless every provider fails",
-            "model_fallback_scope": "limited to observed radar coverage unless RADAR_ENABLE_GLOBAL_MODEL_FALLBACK is true",
+            "model_fallback_scope": (
+                "global"
+                if ENABLE_GLOBAL_MODEL_FALLBACK
+                else "limited to observed radar coverage because RADAR_ENABLE_GLOBAL_MODEL_FALLBACK is false"
+            ),
+            "source_cadence_note": (
+                "The app-facing layer exposes 15-minute offsets through 120 minutes. "
+                "Radar providers may update more frequently or less frequently by region; global fallback is NOAA GFS "
+                "hourly forecast data interpolated to those display offsets."
+            ),
         },
         "products": products,
         "providers": [provider_manifest(result) for result in provider_results],
