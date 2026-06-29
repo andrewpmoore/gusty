@@ -24,6 +24,15 @@ OUTPUT_DIR = "public/data"
 RADAR_DIR = os.path.join(OUTPUT_DIR, "radar")
 RADAR_VECTOR_DIR = os.path.join(OUTPUT_DIR, "radar_vectors")
 RADAR_RAIN_RATE_ID = "radar_rain_rate"
+RADAR_PRECIP_RATE_ID = "radar_precip_rate"
+RADAR_SNOW_RATE_ID = "radar_snow_rate"
+RADAR_MIXED_RATE_ID = "radar_mixed_rate"
+RADAR_SCALAR_LAYER_IDS = [
+    RADAR_RAIN_RATE_ID,
+    RADAR_SNOW_RATE_ID,
+    RADAR_MIXED_RATE_ID,
+    RADAR_PRECIP_RATE_ID,
+]
 RADAR_RAIN_RATE_DIR = os.path.join(OUTPUT_DIR, RADAR_RAIN_RATE_ID)
 LAYER_DIR = os.path.join(OUTPUT_DIR, "layers")
 TIMEOUT = 90
@@ -37,6 +46,7 @@ IEM_N0Q_DOCS_URL = "https://mesonet.agron.iastate.edu/docs/nexrad_composites/"
 MRMS_BUCKET_URL = "https://noaa-mrms-pds.s3.amazonaws.com"
 MRMS_PRODUCT_PREFIX = "CONUS/PrecipRate_00.00"
 MRMS_DOCS_URL = "https://registry.opendata.aws/noaa-mrms/"
+GFS_FILTER_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 MET_OFFICE_PUBLIC_RADAR_URL = "https://www.metoffice.gov.uk/public/weather/observation/map/#?map=Rainfall"
 MET_OFFICE_DATAHUB_URL = "https://datahub.metoffice.gov.uk/"
 ECCC_GEOMET_URL = "https://geo.weather.gc.ca/geomet"
@@ -541,6 +551,11 @@ def env_float(name: str, default: float) -> float:
 RADAR_TARGET_DEGREES = env_float("RADAR_TARGET_DEGREES", 0.025)
 MRMS_TARGET_DEGREES = env_float("MRMS_TARGET_DEGREES", max(RADAR_TARGET_DEGREES, 0.05))
 RADAR_MIN_VALUE = env_float("RADAR_MIN_VALUE", 0)
+RADAR_NOISE_FLOOR_MM_H = env_float("RADAR_NOISE_FLOOR_MM_H", 0.1)
+RADAR_SPECKLE_MAX_VALUE_MM_H = env_float("RADAR_SPECKLE_MAX_VALUE_MM_H", 1.0)
+RADAR_SPECKLE_MIN_NEIGHBORS = int(os.getenv("RADAR_SPECKLE_MIN_NEIGHBORS", "2"))
+PRECIP_TYPE_SNOW_WET_BULB_C = env_float("PRECIP_TYPE_SNOW_WET_BULB_C", 0.0)
+PRECIP_TYPE_RAIN_WET_BULB_C = env_float("PRECIP_TYPE_RAIN_WET_BULB_C", 1.5)
 RADAR_VALUE_PARAMETER = "rain_rate"
 RADAR_VALUE_UNITS = "mm/h"
 RADAR_SOURCE_REFERENCE = "official and public meteorological radar provider references"
@@ -551,6 +566,29 @@ RADAR_COLOR_STOPS = [
     {"value": 16.0, "label": "heavy"},
     {"value": 32.0, "label": "very_heavy"},
     {"value": 64.0, "label": "extreme"},
+]
+DARK_SKY_RAIN_COLOR_STOPS = [
+    {"value": 0.1, "color": "#7fdbff", "label": "trace"},
+    {"value": 1.0, "color": "#39a9ff", "label": "light"},
+    {"value": 4.0, "color": "#2454ff", "label": "moderate"},
+    {"value": 16.0, "color": "#ffe04b", "label": "heavy"},
+    {"value": 32.0, "color": "#ff8c1a", "label": "very_heavy"},
+    {"value": 64.0, "color": "#ff3b30", "label": "extreme"},
+    {"value": 100.0, "color": "#b93cff", "label": "violent"},
+]
+DARK_SKY_SNOW_COLOR_STOPS = [
+    {"value": 0.1, "color": "#d9f3ff", "label": "trace"},
+    {"value": 1.0, "color": "#a8dcff", "label": "light"},
+    {"value": 4.0, "color": "#74b9ff", "label": "moderate"},
+    {"value": 16.0, "color": "#4d7cff", "label": "heavy"},
+    {"value": 32.0, "color": "#8b5cff", "label": "very_heavy"},
+]
+DARK_SKY_MIXED_COLOR_STOPS = [
+    {"value": 0.1, "color": "#f3d2ff", "label": "trace"},
+    {"value": 1.0, "color": "#d088ff", "label": "light"},
+    {"value": 4.0, "color": "#b04cff", "label": "moderate"},
+    {"value": 16.0, "color": "#7a2cff", "label": "heavy"},
+    {"value": 32.0, "color": "#4c1d95", "label": "very_heavy"},
 ]
 RADAR_VECTOR_BANDS = [
     {"min": 0.1, "max": 1.0, "class": "trace"},
@@ -631,6 +669,16 @@ class RadarGrid:
     error: Optional[str] = None
 
 
+@dataclass
+class PrecipTypeGrid:
+    wet_bulb_c: np.ndarray
+    latitudes: np.ndarray
+    longitudes: np.ndarray
+    ref_time: Optional[str]
+    source_url: str
+    attribution: str = "NOAA GFS / NOMADS"
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -668,11 +716,12 @@ def clean_vector_provider_dir(provider_id: str) -> str:
     return provider_dir
 
 
-def clean_rain_rate_dir() -> str:
-    if os.path.exists(RADAR_RAIN_RATE_DIR):
-        shutil.rmtree(RADAR_RAIN_RATE_DIR)
-    os.makedirs(RADAR_RAIN_RATE_DIR, exist_ok=True)
-    return RADAR_RAIN_RATE_DIR
+def clean_scalar_layer_dir(layer_id: str) -> str:
+    layer_dir = os.path.join(OUTPUT_DIR, layer_id)
+    if os.path.exists(layer_dir):
+        shutil.rmtree(layer_dir)
+    os.makedirs(layer_dir, exist_ok=True)
+    return layer_dir
 
 
 def coordinate_label(lat_start: int, lon_start: int) -> Tuple[str, str]:
@@ -1076,6 +1125,115 @@ def latest_mrms_preciprate_key(client: requests.Session) -> Tuple[str, Optional[
         raise ValueError("No current MRMS PrecipRate GRIB2 files found")
     modified, key = max(keys, key=lambda item: item[0])
     return key, modified or None
+
+
+def latest_gfs_run() -> Tuple[str, str]:
+    now = dt.datetime.now(dt.timezone.utc)
+    check_time = now - dt.timedelta(hours=4, minutes=30)
+    run_hours = [0, 6, 12, 18]
+    run_hour = max([hour for hour in run_hours if hour <= check_time.hour], default=18)
+    run_date = check_time.date()
+    if run_hour == 18 and check_time.hour < 4:
+        run_date = run_date - dt.timedelta(days=1)
+    return run_date.strftime("%Y%m%d"), f"{run_hour:02d}"
+
+
+def gfs_filter_url(date_text: str, run_hour: str) -> str:
+    params = {
+        "file": f"gfs.t{run_hour}z.pgrb2.0p25.f000",
+        "lev_2_m_above_ground": "on",
+        "var_TMP": "on",
+        "var_RH": "on",
+        "dir": f"/gfs.{date_text}/{run_hour}/atmos",
+    }
+    return f"{GFS_FILTER_URL}?{urlencode(params)}"
+
+
+def normalize_lonlat_arrays(values: np.ndarray, latitudes: np.ndarray, longitudes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    latitudes = np.asarray(latitudes, dtype=np.float64)
+    longitudes = np.asarray(longitudes, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float32)
+    longitudes = np.where(longitudes > 180.0, longitudes - 360.0, longitudes)
+    if latitudes[0] > latitudes[-1]:
+        latitudes = latitudes[::-1]
+        values = values[::-1, :]
+    if longitudes[0] > longitudes[-1]:
+        order = np.argsort(longitudes)
+        longitudes = longitudes[order]
+        values = values[:, order]
+    return values, latitudes, longitudes
+
+
+def data_var_by_grib_name(dataset: Any, names: Iterable[str]) -> Any:
+    wanted = {name.lower() for name in names}
+    for data_var in dataset.data_vars.values():
+        attrs = data_var.attrs
+        candidates = [
+            str(attrs.get("GRIB_shortName", "")),
+            str(attrs.get("GRIB_name", "")),
+            str(data_var.name),
+        ]
+        if any(candidate.lower() in wanted for candidate in candidates):
+            return data_var
+    raise ValueError(f"Could not find GFS field matching {sorted(wanted)}")
+
+
+def wet_bulb_temperature_c(temp_k_or_c: np.ndarray, relative_humidity: np.ndarray) -> np.ndarray:
+    temp_c = np.where(temp_k_or_c > 150.0, temp_k_or_c - 273.15, temp_k_or_c).astype(np.float32)
+    rh = np.clip(relative_humidity.astype(np.float32), 1.0, 100.0)
+    wet_bulb = (
+        temp_c * np.arctan(0.151977 * np.sqrt(rh + 8.313659))
+        + np.arctan(temp_c + rh)
+        - np.arctan(rh - 1.676331)
+        + 0.00391838 * np.power(rh, 1.5) * np.arctan(0.023101 * rh)
+        - 4.686035
+    )
+    return wet_bulb.astype(np.float32)
+
+
+def fetch_gfs_precip_type_grid(client: requests.Session) -> PrecipTypeGrid:
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise RuntimeError("GFS precipitation typing requires xarray and cfgrib") from exc
+
+    last_error: Optional[Exception] = None
+    run_date, run_hour = latest_gfs_run()
+    first_run = dt.datetime.strptime(f"{run_date}{run_hour}", "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
+    for offset in range(0, 5):
+        run_time = first_run - dt.timedelta(hours=6 * offset)
+        date_text = run_time.strftime("%Y%m%d")
+        hour_text = run_time.strftime("%H")
+        url = gfs_filter_url(date_text, hour_text)
+        try:
+            grib_bytes, _ = get_bytes(client, url)
+            with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
+                handle.write(grib_bytes)
+                handle.flush()
+                dataset = xr.open_dataset(handle.name, engine="cfgrib", backend_kwargs={"indexpath": ""})
+                temp = data_var_by_grib_name(dataset, ["2t", "t2m", "tmp", "temperature"])
+                rh = data_var_by_grib_name(dataset, ["2r", "r2", "rh", "relative humidity"])
+                wet_bulb = wet_bulb_temperature_c(temp.values.astype(np.float32), rh.values.astype(np.float32))
+                latitudes = dataset["latitude"].values.astype(np.float64)
+                longitudes = dataset["longitude"].values.astype(np.float64)
+                valid_time = dataset.coords.get("valid_time")
+                if valid_time is None:
+                    valid_time = dataset.coords.get("time")
+                ref_time = None
+                if valid_time is not None:
+                    ref_time = np.datetime_as_string(valid_time.values, unit="s") + "+00:00"
+            wet_bulb, latitudes, longitudes = normalize_lonlat_arrays(wet_bulb, latitudes, longitudes)
+            return PrecipTypeGrid(
+                wet_bulb_c=wet_bulb,
+                latitudes=latitudes,
+                longitudes=longitudes,
+                ref_time=ref_time or run_time.isoformat(),
+                source_url=url,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise ValueError(f"No usable GFS temperature/RH file found for precipitation typing: {last_error}")
 
 
 def fetch_mrms_precip_rate(client: requests.Session) -> RadarGrid:
@@ -1616,6 +1774,93 @@ def resample_grid_values(grid: RadarGrid, lat_vals: np.ndarray, lon_vals: np.nda
     return output
 
 
+def resample_precip_type_wet_bulb(model: PrecipTypeGrid, lat_vals: np.ndarray, lon_vals: np.ndarray) -> np.ndarray:
+    src_lat = np.asarray(model.latitudes, dtype=np.float64)
+    src_lon = np.asarray(model.longitudes, dtype=np.float64)
+    src_values = np.asarray(model.wet_bulb_c, dtype=np.float32)
+    if src_lat[0] > src_lat[-1]:
+        src_lat = src_lat[::-1]
+        src_values = src_values[::-1, :]
+    if src_lon[0] > src_lon[-1]:
+        src_lon = src_lon[::-1]
+        src_values = src_values[:, ::-1]
+
+    lat_mask = (lat_vals >= src_lat[0]) & (lat_vals <= src_lat[-1])
+    lon_mask = (lon_vals >= src_lon[0]) & (lon_vals <= src_lon[-1])
+    output = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+    if not np.any(lat_mask) or not np.any(lon_mask):
+        return output
+    lat_indices = nearest_indices(src_lat, lat_vals[lat_mask])
+    lon_indices = nearest_indices(src_lon, lon_vals[lon_mask])
+    output[np.ix_(lat_mask, lon_mask)] = src_values[np.ix_(lat_indices, lon_indices)]
+    return output
+
+
+def filter_radar_noise(values: np.ndarray) -> np.ndarray:
+    cleaned = np.where(values >= RADAR_NOISE_FLOOR_MM_H, values, 0.0).astype(np.float32)
+    if RADAR_SPECKLE_MIN_NEIGHBORS <= 0 or RADAR_SPECKLE_MAX_VALUE_MM_H <= 0:
+        return cleaned
+
+    precip = cleaned > 0
+    padded = np.pad(precip.astype(np.uint8), 1, mode="constant")
+    neighbors = np.zeros(cleaned.shape, dtype=np.uint8)
+    for row_offset in (0, 1, 2):
+        for col_offset in (0, 1, 2):
+            if row_offset == 1 and col_offset == 1:
+                continue
+            neighbors += padded[row_offset : row_offset + cleaned.shape[0], col_offset : col_offset + cleaned.shape[1]]
+    speckle = (
+        (cleaned > 0)
+        & (cleaned <= RADAR_SPECKLE_MAX_VALUE_MM_H)
+        & (neighbors < RADAR_SPECKLE_MIN_NEIGHBORS)
+    )
+    cleaned[speckle] = 0.0
+    return cleaned
+
+
+def apply_precip_type(values: np.ndarray, wet_bulb_c: Optional[np.ndarray], product_id: str) -> np.ndarray:
+    if product_id == RADAR_PRECIP_RATE_ID:
+        return values
+    if wet_bulb_c is None:
+        return values if product_id == RADAR_RAIN_RATE_ID else np.zeros(values.shape, dtype=np.float32)
+    if product_id == RADAR_SNOW_RATE_ID:
+        mask = wet_bulb_c <= PRECIP_TYPE_SNOW_WET_BULB_C
+    elif product_id == RADAR_MIXED_RATE_ID:
+        mask = (wet_bulb_c > PRECIP_TYPE_SNOW_WET_BULB_C) & (wet_bulb_c <= PRECIP_TYPE_RAIN_WET_BULB_C)
+    else:
+        mask = wet_bulb_c > PRECIP_TYPE_RAIN_WET_BULB_C
+    mask = np.where(np.isfinite(wet_bulb_c), mask, product_id == RADAR_RAIN_RATE_ID)
+    return np.where(mask, values, 0.0).astype(np.float32)
+
+
+def scalar_product_palette(product_id: str) -> List[Dict[str, Any]]:
+    if product_id == RADAR_SNOW_RATE_ID:
+        return DARK_SKY_SNOW_COLOR_STOPS
+    if product_id == RADAR_MIXED_RATE_ID:
+        return DARK_SKY_MIXED_COLOR_STOPS
+    return DARK_SKY_RAIN_COLOR_STOPS
+
+
+def scalar_product_name(product_id: str) -> str:
+    names = {
+        RADAR_RAIN_RATE_ID: "Radar Rain Rate",
+        RADAR_SNOW_RATE_ID: "Radar Snow Rate",
+        RADAR_MIXED_RATE_ID: "Radar Mixed Precipitation Rate",
+        RADAR_PRECIP_RATE_ID: "Radar Total Precipitation Rate",
+    }
+    return names[product_id]
+
+
+def scalar_product_precip_type(product_id: str) -> str:
+    precip_types = {
+        RADAR_RAIN_RATE_ID: "rain",
+        RADAR_SNOW_RATE_ID: "snow",
+        RADAR_MIXED_RATE_ID: "mixed",
+        RADAR_PRECIP_RATE_ID: "all",
+    }
+    return precip_types[product_id]
+
+
 def grid_bounds(grid: RadarGrid) -> Tuple[float, float, float, float]:
     return (
         float(np.nanmin(grid.longitudes)),
@@ -1639,13 +1884,19 @@ def tile_axis(start: float, end: float, step: float, descending: bool = False) -
     return values[(values >= start) & (values <= end)]
 
 
-def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
+def generate_scalar_precip_tiles(
+    grids: List[RadarGrid],
+    product_id: str,
+    precip_type_grid: Optional[PrecipTypeGrid] = None,
+) -> Dict[str, Any]:
     active_grids = [grid for grid in grids if grid.values.size and float(np.nanmax(grid.values)) > 0]
-    rain_rate_dir = clean_rain_rate_dir()
+    product_dir = clean_scalar_layer_dir(product_id)
+    product_name = scalar_product_name(product_id)
+    precip_type = scalar_product_precip_type(product_id)
     if not active_grids:
         return {
-            "id": RADAR_RAIN_RATE_ID,
-            "name": "Radar Rain Rate",
+            "id": product_id,
+            "name": product_name,
             "status": "configuration_required",
             "region": "Global available radar coverage",
             "bounds": [-180.0, -90.0, 180.0, 90.0],
@@ -1655,7 +1906,7 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
             "units": RADAR_VALUE_UNITS,
             "value_parameter": RADAR_VALUE_PARAMETER,
             "value_units": RADAR_VALUE_UNITS,
-            "path": RADAR_RAIN_RATE_ID,
+            "path": product_id,
             "attribution": None,
             "source_url": RADAR_SOURCE_REFERENCE,
             "tile_format": TILE_FORMAT,
@@ -1664,8 +1915,10 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
                 "parameter": RADAR_VALUE_PARAMETER,
                 "units": RADAR_VALUE_UNITS,
                 "client_coloring": True,
-                "recommended_color_stops": RADAR_COLOR_STOPS,
+                "recommended_color_stops": scalar_product_palette(product_id),
                 "overview_reduction": "max",
+                "precip_type": precip_type,
+                "noise_floor_mm_h": RADAR_NOISE_FLOOR_MM_H,
             },
         }
 
@@ -1702,6 +1955,9 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
         merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
         for grid in overlapping:
             merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+        merged_values = filter_radar_noise(merged_values)
+        wet_bulb = resample_precip_type_wet_bulb(precip_type_grid, lat_vals, lon_vals) if precip_type_grid else None
+        merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
         if float(np.nanmax(merged_values)) <= 0:
             continue
 
@@ -1732,18 +1988,21 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
             merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
             for grid in overlapping:
                 merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+            merged_values = filter_radar_noise(merged_values)
+            wet_bulb = resample_precip_type_wet_bulb(precip_type_grid, lat_vals, lon_vals) if precip_type_grid else None
+            merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
             overview_tile = build_overview_tile(lon_vals, lat_vals, merged_values)
             if overview_tile:
                 entries.append((overview_tile_key(pack_lat_start, pack_lon_start), overview_tile))
-        pack_path = os.path.join(rain_rate_dir, pack_filename(RADAR_RAIN_RATE_ID, 0, pack_lat_start, pack_lon_start))
+        pack_path = os.path.join(product_dir, pack_filename(product_id, 0, pack_lat_start, pack_lon_start))
         write_tile_pack(pack_path, entries)
         pack_count += 1
 
     ref_times = [grid.ref_time for grid in active_grids if grid.ref_time]
     attributions = sorted({grid.attribution for grid in active_grids if grid.attribution})
     return {
-        "id": RADAR_RAIN_RATE_ID,
-        "name": "Radar Rain Rate",
+        "id": product_id,
+        "name": product_name,
         "status": "ok" if tile_count else "configuration_required",
         "region": "Global available radar coverage",
         "bounds": [-180.0, -90.0, 180.0, 90.0],
@@ -1754,7 +2013,7 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
         "units": RADAR_VALUE_UNITS,
         "value_parameter": RADAR_VALUE_PARAMETER,
         "value_units": RADAR_VALUE_UNITS,
-        "path": RADAR_RAIN_RATE_ID,
+        "path": product_id,
         "attribution": " / ".join(attributions) if attributions else None,
         "source_url": RADAR_SOURCE_REFERENCE,
         "provider_url": RADAR_SOURCE_REFERENCE,
@@ -1766,11 +2025,30 @@ def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
             "value_range": [0, max(1, round(max_value, 1))],
             "target_degrees": RADAR_TARGET_DEGREES,
             "client_coloring": True,
-            "recommended_color_stops": RADAR_COLOR_STOPS,
+            "recommended_color_stops": scalar_product_palette(product_id),
             "overview_reduction": "max",
             "source_provider_ids": [grid.provider_id for grid in active_grids],
+            "precip_type": precip_type,
+            "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid else "untyped fallback",
+            "precip_type_ref_time": precip_type_grid.ref_time if precip_type_grid else None,
+            "precip_type_source_url": precip_type_grid.source_url if precip_type_grid else None,
+            "wet_bulb_thresholds_c": {
+                "snow_lte": PRECIP_TYPE_SNOW_WET_BULB_C,
+                "mixed_gt": PRECIP_TYPE_SNOW_WET_BULB_C,
+                "mixed_lte": PRECIP_TYPE_RAIN_WET_BULB_C,
+                "rain_gt": PRECIP_TYPE_RAIN_WET_BULB_C,
+            },
+            "noise_floor_mm_h": RADAR_NOISE_FLOOR_MM_H,
+            "speckle_filter": {
+                "max_value_mm_h": RADAR_SPECKLE_MAX_VALUE_MM_H,
+                "min_neighbors": RADAR_SPECKLE_MIN_NEIGHBORS,
+            },
         },
     }
+
+
+def generate_rain_rate_tiles(grids: List[RadarGrid]) -> Dict[str, Any]:
+    return generate_scalar_precip_tiles(grids, RADAR_RAIN_RATE_ID)
 
 
 def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
@@ -2058,11 +2336,14 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         shutil.rmtree(RADAR_DIR)
     if os.path.exists(RADAR_VECTOR_DIR):
         shutil.rmtree(RADAR_VECTOR_DIR)
-    if os.path.exists(RADAR_RAIN_RATE_DIR):
-        shutil.rmtree(RADAR_RAIN_RATE_DIR)
+    for layer_id in RADAR_SCALAR_LAYER_IDS:
+        layer_dir = os.path.join(OUTPUT_DIR, layer_id)
+        if os.path.exists(layer_dir):
+            shutil.rmtree(layer_dir)
     os.makedirs(RADAR_DIR, exist_ok=True)
     os.makedirs(RADAR_VECTOR_DIR, exist_ok=True)
-    os.makedirs(RADAR_RAIN_RATE_DIR, exist_ok=True)
+    for layer_id in RADAR_SCALAR_LAYER_IDS:
+        os.makedirs(os.path.join(OUTPUT_DIR, layer_id), exist_ok=True)
     os.makedirs(LAYER_DIR, exist_ok=True)
 
     results: List[Dict[str, Any]] = []
@@ -2221,9 +2502,22 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             results.append(result)
             result_ids.add(result["id"])
 
-    rain_rate_result = generate_rain_rate_tiles(active_grids)
-    results.insert(0, rain_rate_result)
-    result_ids.add(rain_rate_result["id"])
+    precip_type_grid: Optional[PrecipTypeGrid] = None
+    precip_type_error: Optional[str] = None
+    try:
+        precip_type_grid = fetch_gfs_precip_type_grid(client)
+    except Exception as exc:
+        precip_type_error = str(exc)
+
+    scalar_results = []
+    for product_id in (RADAR_RAIN_RATE_ID, RADAR_SNOW_RATE_ID, RADAR_MIXED_RATE_ID, RADAR_PRECIP_RATE_ID):
+        product_precip_type_grid = precip_type_grid if product_id != RADAR_PRECIP_RATE_ID else None
+        result = generate_scalar_precip_tiles(active_grids, product_id, product_precip_type_grid)
+        if precip_type_error and product_id != RADAR_PRECIP_RATE_ID:
+            result["metadata"]["precip_type_error"] = precip_type_error
+        scalar_results.append(result)
+        result_ids.add(result["id"])
+    results = scalar_results + results
 
     manifest = {
         "generated_at": now_iso(),
@@ -2233,6 +2527,13 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         "value_parameter": RADAR_VALUE_PARAMETER,
         "value_units": RADAR_VALUE_UNITS,
         "recommended_color_stops": RADAR_COLOR_STOPS,
+        "dark_sky_color_stops": {
+            "rain": DARK_SKY_RAIN_COLOR_STOPS,
+            "snow": DARK_SKY_SNOW_COLOR_STOPS,
+            "mixed": DARK_SKY_MIXED_COLOR_STOPS,
+        },
+        "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid else None,
+        "precip_type_error": precip_type_error,
         "configured_provider_count": len(configured_specs),
         "providers": results,
     }
