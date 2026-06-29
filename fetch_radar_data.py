@@ -2050,30 +2050,14 @@ def generate_scalar_precip_tiles(
     grid_bounds_list = [(grid, grid_bounds(grid)) for grid in active_grids]
     tile_origins = set()
 
-    # 1. Add tile origins from active observations (if we are blending them)
-    if blend_obs_factor > 0.0:
-        for grid, bounds in grid_bounds_list:
-            west, south, east, north = bounds
-            for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-                for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-                    if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
-                        continue
-                    tile_origins.add((lat_start, lon_start))
-
-    # 2. Add tile origins from GFS forecast (if we are blending GFS)
-    if blend_obs_factor < 1.0:
-        for gfs_grid in (gfs_grid_low, gfs_grid_high):
-            if gfs_grid is not None and gfs_grid.values.size > 0:
-                y_idx, x_idx = np.where(gfs_grid.values > 0.05)
-                if len(y_idx) > 0:
-                    lats = gfs_grid.latitudes[y_idx]
-                    lons = gfs_grid.longitudes[x_idx]
-                    for lat, lon in zip(lats, lons):
-                        lat_start = math.floor(lat / TILE_SIZE) * TILE_SIZE
-                        lon_start = math.floor(lon / TILE_SIZE) * TILE_SIZE
-                        if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
-                            continue
-                        tile_origins.add((lat_start, lon_start))
+    # Limit tiles to observation regions since GFS is global and generating tiles globally is too slow
+    for grid, bounds in grid_bounds_list:
+        west, south, east, north = bounds
+        for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+            for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
+                    continue
+                tile_origins.add((lat_start, lon_start))
 
     pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes, int, int]]] = {}
     tile_count = 0
