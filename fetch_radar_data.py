@@ -2234,9 +2234,9 @@ def generate_scalar_precip_tiles(
             "overview_reduction": "max",
             "source_provider_ids": [grid.provider_id for grid in active_grids],
             "precip_type": precip_type,
-            "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid else "untyped fallback",
-            "precip_type_ref_time": precip_type_grid.ref_time if precip_type_grid else None,
-            "precip_type_source_url": precip_type_grid.source_url if precip_type_grid else None,
+            "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid_low else "untyped fallback",
+            "precip_type_ref_time": precip_type_grid_low.ref_time if precip_type_grid_low else None,
+            "precip_type_source_url": precip_type_grid_low.source_url if precip_type_grid_low else None,
             "wet_bulb_thresholds_c": {
                 "snow_lte": PRECIP_TYPE_SNOW_WET_BULB_C,
                 "mixed_gt": PRECIP_TYPE_SNOW_WET_BULB_C,
