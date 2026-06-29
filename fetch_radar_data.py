@@ -568,27 +568,29 @@ RADAR_COLOR_STOPS = [
     {"value": 64.0, "label": "extreme"},
 ]
 DARK_SKY_RAIN_COLOR_STOPS = [
-    {"value": 0.1, "color": "#7fdbff", "label": "trace"},
-    {"value": 1.0, "color": "#39a9ff", "label": "light"},
-    {"value": 4.0, "color": "#2454ff", "label": "moderate"},
-    {"value": 16.0, "color": "#ffe04b", "label": "heavy"},
-    {"value": 32.0, "color": "#ff8c1a", "label": "very_heavy"},
-    {"value": 64.0, "color": "#ff3b30", "label": "extreme"},
-    {"value": 100.0, "color": "#b93cff", "label": "violent"},
+    {"value": 0.1, "color": "#3b82f6", "label": "trace"},
+    {"value": 1.0, "color": "#8b5cf6", "label": "light"},
+    {"value": 4.0, "color": "#ec4899", "label": "moderate"},
+    {"value": 16.0, "color": "#f43f5e", "label": "heavy"},
+    {"value": 32.0, "color": "#f97316", "label": "very_heavy"},
+    {"value": 64.0, "color": "#eab308", "label": "extreme"},
+    {"value": 100.0, "color": "#ffff00", "label": "violent"},
 ]
 DARK_SKY_SNOW_COLOR_STOPS = [
-    {"value": 0.1, "color": "#d9f3ff", "label": "trace"},
-    {"value": 1.0, "color": "#a8dcff", "label": "light"},
-    {"value": 4.0, "color": "#74b9ff", "label": "moderate"},
-    {"value": 16.0, "color": "#4d7cff", "label": "heavy"},
-    {"value": 32.0, "color": "#8b5cff", "label": "very_heavy"},
+    {"value": 0.1, "color": "#e0f2fe", "label": "trace"},
+    {"value": 1.0, "color": "#bae6fd", "label": "light"},
+    {"value": 4.0, "color": "#7dd3fc", "label": "moderate"},
+    {"value": 16.0, "color": "#38bdf8", "label": "heavy"},
+    {"value": 32.0, "color": "#0284c7", "label": "very_heavy"},
+    {"value": 64.0, "color": "#0369a1", "label": "extreme"},
 ]
 DARK_SKY_MIXED_COLOR_STOPS = [
-    {"value": 0.1, "color": "#f3d2ff", "label": "trace"},
-    {"value": 1.0, "color": "#d088ff", "label": "light"},
-    {"value": 4.0, "color": "#b04cff", "label": "moderate"},
-    {"value": 16.0, "color": "#7a2cff", "label": "heavy"},
-    {"value": 32.0, "color": "#4c1d95", "label": "very_heavy"},
+    {"value": 0.1, "color": "#f3e8ff", "label": "trace"},
+    {"value": 1.0, "color": "#e9d5ff", "label": "light"},
+    {"value": 4.0, "color": "#c084fc", "label": "moderate"},
+    {"value": 16.0, "color": "#a855f7", "label": "heavy"},
+    {"value": 32.0, "color": "#7e22ce", "label": "very_heavy"},
+    {"value": 64.0, "color": "#581c87", "label": "extreme"},
 ]
 RADAR_VECTOR_BANDS = [
     {"min": 0.1, "max": 1.0, "class": "trace"},
@@ -1138,12 +1140,14 @@ def latest_gfs_run() -> Tuple[str, str]:
     return run_date.strftime("%Y%m%d"), f"{run_hour:02d}"
 
 
-def gfs_filter_url(date_text: str, run_hour: str) -> str:
+def gfs_filter_url(date_text: str, run_hour: str, forecast_hour: int = 0) -> str:
     params = {
-        "file": f"gfs.t{run_hour}z.pgrb2.0p25.f000",
+        "file": f"gfs.t{run_hour}z.pgrb2.0p25.f{forecast_hour:03d}",
         "lev_2_m_above_ground": "on",
         "var_TMP": "on",
         "var_RH": "on",
+        "lev_surface": "on",
+        "var_PRATE": "on",
         "dir": f"/gfs.{date_text}/{run_hour}/atmos",
     }
     return f"{GFS_FILTER_URL}?{urlencode(params)}"
@@ -1234,6 +1238,76 @@ def fetch_gfs_precip_type_grid(client: requests.Session) -> PrecipTypeGrid:
             last_error = exc
             continue
     raise ValueError(f"No usable GFS temperature/RH file found for precipitation typing: {last_error}")
+
+
+def fetch_gfs_forecast_grids(client: requests.Session, forecast_hour: int) -> Tuple[RadarGrid, PrecipTypeGrid]:
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise RuntimeError("GFS forecast fetching requires xarray and cfgrib") from exc
+
+    last_error: Optional[Exception] = None
+    run_date, run_hour = latest_gfs_run()
+    first_run = dt.datetime.strptime(f"{run_date}{run_hour}", "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
+    for offset in range(0, 5):
+        run_time = first_run - dt.timedelta(hours=6 * offset)
+        date_text = run_time.strftime("%Y%m%d")
+        hour_text = run_time.strftime("%H")
+        url = gfs_filter_url(date_text, hour_text, forecast_hour)
+        try:
+            grib_bytes, _ = get_bytes(client, url)
+            with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
+                handle.write(grib_bytes)
+                handle.flush()
+                dataset = xr.open_dataset(handle.name, engine="cfgrib", backend_kwargs={"indexpath": ""})
+                
+                temp = data_var_by_grib_name(dataset, ["2t", "t2m", "tmp", "temperature"])
+                rh = data_var_by_grib_name(dataset, ["2r", "r2", "rh", "relative humidity"])
+                prate = data_var_by_grib_name(dataset, ["prate", "precipitation rate"])
+                
+                wet_bulb = wet_bulb_temperature_c(temp.values.astype(np.float32), rh.values.astype(np.float32))
+                precip_rate = prate.values.astype(np.float32) * 3600.0  # kg m-2 s-1 to mm/h
+                
+                latitudes = dataset["latitude"].values.astype(np.float64)
+                longitudes = dataset["longitude"].values.astype(np.float64)
+                valid_time = dataset.coords.get("valid_time")
+                if valid_time is None:
+                    valid_time = dataset.coords.get("time")
+                ref_time = None
+                if valid_time is not None:
+                    ref_time = np.datetime_as_string(valid_time.values, unit="s") + "+00:00"
+            
+            wet_bulb, latitudes, longitudes = normalize_lonlat_arrays(wet_bulb, latitudes, longitudes)
+            precip_rate, _, _ = normalize_lonlat_arrays(precip_rate, dataset["latitude"].values.astype(np.float64), dataset["longitude"].values.astype(np.float64))
+            
+            gfs_ref_time = ref_time or run_time.isoformat()
+            
+            precip_grid = RadarGrid(
+                provider_id="gfs_forecast",
+                name="GFS Forecast Precip Rate",
+                values=precip_rate,
+                latitudes=latitudes,
+                longitudes=longitudes,
+                ref_time=gfs_ref_time,
+                source_url=url,
+                attribution="NOAA GFS",
+                region="Global",
+            )
+            
+            type_grid = PrecipTypeGrid(
+                wet_bulb_c=wet_bulb,
+                latitudes=latitudes,
+                longitudes=longitudes,
+                ref_time=gfs_ref_time,
+                source_url=url,
+                attribution="NOAA GFS",
+            )
+            
+            return precip_grid, type_grid
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise ValueError(f"No usable GFS forecast file found for hour {forecast_hour}: {last_error}")
 
 
 def fetch_mrms_precip_rate(client: requests.Session) -> RadarGrid:
@@ -1751,10 +1825,15 @@ def nearest_indices(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.where(np.abs(target - left) <= np.abs(right - target), positions - 1, positions)
 
 
-def resample_grid_values(grid: RadarGrid, lat_vals: np.ndarray, lon_vals: np.ndarray) -> np.ndarray:
-    src_lat = np.asarray(grid.latitudes, dtype=np.float64)
-    src_lon = np.asarray(grid.longitudes, dtype=np.float64)
-    src_values = np.asarray(grid.values, dtype=np.float32)
+def bilinear_interpolate_coords(src_lat: np.ndarray, src_lon: np.ndarray, src_values: np.ndarray, target_lats: np.ndarray, target_lons: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
+    src_lat = np.asarray(src_lat, dtype=np.float64)
+    src_lon = np.asarray(src_lon, dtype=np.float64)
+    src_values = np.asarray(src_values, dtype=np.float32)
+
+    if len(src_lat) < 2 or len(src_lon) < 2:
+        return np.full((len(target_lats), len(target_lons)), fill_value, dtype=np.float32)
+
+    # Ensure source dimensions are sorted ascending for np.interp
     if src_lat[0] > src_lat[-1]:
         src_lat = src_lat[::-1]
         src_values = src_values[::-1, :]
@@ -1762,38 +1841,69 @@ def resample_grid_values(grid: RadarGrid, lat_vals: np.ndarray, lon_vals: np.nda
         src_lon = src_lon[::-1]
         src_values = src_values[:, ::-1]
 
-    output = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-    lat_mask = (lat_vals >= src_lat[0]) & (lat_vals <= src_lat[-1])
-    lon_mask = (lon_vals >= src_lon[0]) & (lon_vals <= src_lon[-1])
+    # Mask targets falling outside source bounding box
+    lat_mask = (target_lats >= src_lat[0]) & (target_lats <= src_lat[-1])
+    lon_mask = (target_lons >= src_lon[0]) & (target_lons <= src_lon[-1])
+
+    output = np.full((len(target_lats), len(target_lons)), fill_value, dtype=np.float32)
     if not np.any(lat_mask) or not np.any(lon_mask):
         return output
 
-    lat_indices = nearest_indices(src_lat, lat_vals[lat_mask])
-    lon_indices = nearest_indices(src_lon, lon_vals[lon_mask])
-    output[np.ix_(lat_mask, lon_mask)] = src_values[np.ix_(lat_indices, lon_indices)]
+    target_lats_overlap = target_lats[lat_mask]
+    target_lons_overlap = target_lons[lon_mask]
+
+    src_lat_indices = np.arange(len(src_lat))
+    src_lon_indices = np.arange(len(src_lon))
+
+    # Map target coordinates to fractional indices in source grid
+    lat_idx_frac = np.interp(target_lats_overlap, src_lat, src_lat_indices)
+    lon_idx_frac = np.interp(target_lons_overlap, src_lon, src_lon_indices)
+
+    # Mesh grid of fractional coordinates
+    lon_grid, lat_grid = np.meshgrid(lon_idx_frac, lat_idx_frac)
+
+    # Coordinate bounding indices
+    x0 = np.floor(lon_grid).astype(np.int32)
+    x1 = np.minimum(x0 + 1, len(src_lon) - 1)
+    y0 = np.floor(lat_grid).astype(np.int32)
+    y1 = np.minimum(y0 + 1, len(src_lat) - 1)
+
+    # Bilinear interpolation weights
+    wa = (x1 - lon_grid) * (y1 - lat_grid)
+    wb = (lon_grid - x0) * (y1 - lat_grid)
+    wc = (x1 - lon_grid) * (lat_grid - y0)
+    wd = (lon_grid - x0) * (lat_grid - y0)
+
+    # Interpolate overlapping area
+    interpolated = (
+        src_values[y0, x0] * wa +
+        src_values[y0, x1] * wb +
+        src_values[y1, x0] * wc +
+        src_values[y1, x1] * wd
+    )
+
+    output[np.ix_(lat_mask, lon_mask)] = np.where(np.isnan(interpolated), fill_value, interpolated)
     return output
+
+
+def resample_grid_values(grid: RadarGrid, lat_vals: np.ndarray, lon_vals: np.ndarray) -> np.ndarray:
+    return bilinear_interpolate_coords(grid.latitudes, grid.longitudes, grid.values, lat_vals, lon_vals, fill_value=0.0)
 
 
 def resample_precip_type_wet_bulb(model: PrecipTypeGrid, lat_vals: np.ndarray, lon_vals: np.ndarray) -> np.ndarray:
-    src_lat = np.asarray(model.latitudes, dtype=np.float64)
-    src_lon = np.asarray(model.longitudes, dtype=np.float64)
-    src_values = np.asarray(model.wet_bulb_c, dtype=np.float32)
-    if src_lat[0] > src_lat[-1]:
-        src_lat = src_lat[::-1]
-        src_values = src_values[::-1, :]
-    if src_lon[0] > src_lon[-1]:
-        src_lon = src_lon[::-1]
-        src_values = src_values[:, ::-1]
+    return bilinear_interpolate_coords(model.latitudes, model.longitudes, model.wet_bulb_c, lat_vals, lon_vals, fill_value=np.nan)
 
-    lat_mask = (lat_vals >= src_lat[0]) & (lat_vals <= src_lat[-1])
-    lon_mask = (lon_vals >= src_lon[0]) & (lon_vals <= src_lon[-1])
-    output = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
-    if not np.any(lat_mask) or not np.any(lon_mask):
-        return output
-    lat_indices = nearest_indices(src_lat, lat_vals[lat_mask])
-    lon_indices = nearest_indices(src_lon, lon_vals[lon_mask])
-    output[np.ix_(lat_mask, lon_mask)] = src_values[np.ix_(lat_indices, lon_indices)]
-    return output
+
+def smooth_grid(values: np.ndarray, passes: int = 2) -> np.ndarray:
+    smoothed = values.copy()
+    for _ in range(passes):
+        padded = np.pad(smoothed, 1, mode="edge")
+        smoothed = (
+            padded[1:-1, 1:-1] * 0.25 +
+            (padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:]) * 0.125 +
+            (padded[:-2, :-2] + padded[:-2, 2:] + padded[2:, :-2] + padded[2:, 2:]) * 0.0625
+        )
+    return smoothed
 
 
 def filter_radar_noise(values: np.ndarray) -> np.ndarray:
@@ -1884,16 +1994,31 @@ def tile_axis(start: float, end: float, step: float, descending: bool = False) -
     return values[(values >= start) & (values <= end)]
 
 
+def pack_filename_minutes(provider_id: str, minutes: int, lat_start: int, lon_start: int) -> str:
+    lat_label, lon_label = coordinate_label(lat_start, lon_start)
+    return f"{provider_id}_{minutes}m_{lat_label}_{lon_label}.{PACK_FORMAT['extension']}"
+
+
 def generate_scalar_precip_tiles(
-    grids: List[RadarGrid],
+    active_grids: List[RadarGrid],
     product_id: str,
-    precip_type_grid: Optional[PrecipTypeGrid] = None,
+    precip_type_grid_low: Optional[PrecipTypeGrid],
+    precip_type_grid_high: Optional[PrecipTypeGrid],
+    gfs_grid_low: Optional[RadarGrid],
+    gfs_grid_high: Optional[RadarGrid],
+    alpha: float,
+    blend_obs_factor: float,
+    forecast_offset_minutes: int = 0,
 ) -> Dict[str, Any]:
-    active_grids = [grid for grid in grids if grid.values.size and float(np.nanmax(grid.values)) > 0]
-    product_dir = clean_scalar_layer_dir(product_id)
+    product_dir = os.path.join(OUTPUT_DIR, product_id)
+    os.makedirs(product_dir, exist_ok=True)
     product_name = scalar_product_name(product_id)
     precip_type = scalar_product_precip_type(product_id)
-    if not active_grids:
+
+    has_gfs = (gfs_grid_low is not None and gfs_grid_low.values.size > 0) or (gfs_grid_high is not None and gfs_grid_high.values.size > 0)
+    has_obs = len(active_grids) > 0 and any(grid.values.size > 0 for grid in active_grids)
+
+    if not has_obs and not has_gfs:
         return {
             "id": product_id,
             "name": product_name,
@@ -1924,13 +2049,31 @@ def generate_scalar_precip_tiles(
 
     grid_bounds_list = [(grid, grid_bounds(grid)) for grid in active_grids]
     tile_origins = set()
-    for _, bounds in grid_bounds_list:
-        west, south, east, north = bounds
-        for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-            for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
-                if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
-                    continue
-                tile_origins.add((lat_start, lon_start))
+
+    # 1. Add tile origins from active observations (if we are blending them)
+    if blend_obs_factor > 0.0:
+        for grid, bounds in grid_bounds_list:
+            west, south, east, north = bounds
+            for lat_start in range(math.floor(south / TILE_SIZE) * TILE_SIZE, math.floor(north / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                for lon_start in range(math.floor(west / TILE_SIZE) * TILE_SIZE, math.floor(east / TILE_SIZE) * TILE_SIZE + TILE_SIZE, TILE_SIZE):
+                    if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
+                        continue
+                    tile_origins.add((lat_start, lon_start))
+
+    # 2. Add tile origins from GFS forecast (if we are blending GFS)
+    if blend_obs_factor < 1.0:
+        for gfs_grid in (gfs_grid_low, gfs_grid_high):
+            if gfs_grid is not None and gfs_grid.values.size > 0:
+                y_idx, x_idx = np.where(gfs_grid.values > 0.05)
+                if len(y_idx) > 0:
+                    lats = gfs_grid.latitudes[y_idx]
+                    lons = gfs_grid.longitudes[x_idx]
+                    for lat, lon in zip(lats, lons):
+                        lat_start = math.floor(lat / TILE_SIZE) * TILE_SIZE
+                        lon_start = math.floor(lon / TILE_SIZE) * TILE_SIZE
+                        if lat_start < -90 or lat_start >= 90 or lon_start < -180 or lon_start >= 180:
+                            continue
+                        tile_origins.add((lat_start, lon_start))
 
     pack_entries: Dict[Tuple[int, int], List[Tuple[str, bytes, int, int]]] = {}
     tile_count = 0
@@ -1939,25 +2082,56 @@ def generate_scalar_precip_tiles(
         lat_end = min(lat_start + TILE_SIZE, 90)
         lon_end = min(lon_start + TILE_SIZE, 180)
         tile_bounds = (float(lon_start), float(lat_start), float(lon_end), float(lat_end))
-        overlapping = [
+
+        overlapping_obs = [
             grid
             for grid, bounds in grid_bounds_list
             if intersects_bounds(tile_bounds, bounds)
         ]
-        if not overlapping:
-            continue
 
         lat_vals = tile_axis(float(lat_start), float(lat_end), RADAR_TARGET_DEGREES, descending=True)
         lon_vals = tile_axis(float(lon_start), float(lon_end), RADAR_TARGET_DEGREES)
         if len(lat_vals) == 0 or len(lon_vals) == 0:
             continue
 
-        merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-        for grid in overlapping:
-            merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+        # A. Observations
+        obs_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+        if blend_obs_factor > 0.0 and overlapping_obs:
+            for grid in overlapping_obs:
+                obs_values = np.maximum(obs_values, resample_grid_values(grid, lat_vals, lon_vals))
+
+        # B. GFS low/high
+        gfs_low = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+        if blend_obs_factor < 1.0 and gfs_grid_low is not None:
+            gfs_low = resample_grid_values(gfs_grid_low, lat_vals, lon_vals)
+
+        gfs_high = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+        if blend_obs_factor < 1.0 and gfs_grid_high is not None:
+            gfs_high = resample_grid_values(gfs_grid_high, lat_vals, lon_vals)
+
+        gfs_val = (1.0 - alpha) * gfs_low + alpha * gfs_high
+
+        # C. Blend Observations and GFS
+        merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
         merged_values = filter_radar_noise(merged_values)
-        wet_bulb = resample_precip_type_wet_bulb(precip_type_grid, lat_vals, lon_vals) if precip_type_grid else None
+
+        # D. Wet-bulb (snow/mixed precipitation typing)
+        wb_low = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+        if precip_type_grid_low is not None:
+            wb_low = resample_precip_type_wet_bulb(precip_type_grid_low, lat_vals, lon_vals)
+
+        wb_high = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+        if precip_type_grid_high is not None:
+            wb_high = resample_precip_type_wet_bulb(precip_type_grid_high, lat_vals, lon_vals)
+
+        wet_bulb = np.where(np.isnan(wb_low), wb_high, wb_low)
+        mask = ~np.isnan(wb_low) & ~np.isnan(wb_high)
+        wet_bulb[mask] = (1.0 - alpha) * wb_low[mask] + alpha * wb_high[mask]
+
+        # E. Typing, smoothing, noise ceiling
         merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
+        merged_values = smooth_grid(merged_values, passes=2)
+        merged_values = np.where(merged_values >= 0.05, merged_values, 0.0).astype(np.float32)
         if float(np.nanmax(merged_values)) <= 0:
             continue
 
@@ -1977,24 +2151,55 @@ def generate_scalar_precip_tiles(
         pack_lat_end = min(pack_lat_start + PACK_LAT_SIZE, 90)
         pack_lon_end = min(pack_lon_start + PACK_LON_SIZE, 180)
         pack_bounds = (float(pack_lon_start), float(pack_lat_start), float(pack_lon_end), float(pack_lat_end))
-        overlapping = [
+
+        overlapping_obs = [
             grid
             for grid, bounds in grid_bounds_list
             if intersects_bounds(pack_bounds, bounds)
         ]
-        if overlapping:
-            lat_vals = tile_axis(float(pack_lat_start), float(pack_lat_end), RADAR_TARGET_DEGREES, descending=True)
-            lon_vals = tile_axis(float(pack_lon_start), float(pack_lon_end), RADAR_TARGET_DEGREES)
-            merged_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
-            for grid in overlapping:
-                merged_values = np.maximum(merged_values, resample_grid_values(grid, lat_vals, lon_vals))
+
+        lat_vals = tile_axis(float(pack_lat_start), float(pack_lat_end), RADAR_TARGET_DEGREES, descending=True)
+        lon_vals = tile_axis(float(pack_lon_start), float(pack_lon_end), RADAR_TARGET_DEGREES)
+        if len(lat_vals) > 0 and len(lon_vals) > 0:
+            obs_values = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+            if blend_obs_factor > 0.0 and overlapping_obs:
+                for grid in overlapping_obs:
+                    obs_values = np.maximum(obs_values, resample_grid_values(grid, lat_vals, lon_vals))
+
+            gfs_low = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+            if blend_obs_factor < 1.0 and gfs_grid_low is not None:
+                gfs_low = resample_grid_values(gfs_grid_low, lat_vals, lon_vals)
+
+            gfs_high = np.zeros((len(lat_vals), len(lon_vals)), dtype=np.float32)
+            if blend_obs_factor < 1.0 and gfs_grid_high is not None:
+                gfs_high = resample_grid_values(gfs_grid_high, lat_vals, lon_vals)
+
+            gfs_val = (1.0 - alpha) * gfs_low + alpha * gfs_high
+
+            merged_values = blend_obs_factor * obs_values + (1.0 - blend_obs_factor) * gfs_val
             merged_values = filter_radar_noise(merged_values)
-            wet_bulb = resample_precip_type_wet_bulb(precip_type_grid, lat_vals, lon_vals) if precip_type_grid else None
+
+            wb_low = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+            if precip_type_grid_low is not None:
+                wb_low = resample_precip_type_wet_bulb(precip_type_grid_low, lat_vals, lon_vals)
+
+            wb_high = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+            if precip_type_grid_high is not None:
+                wb_high = resample_precip_type_wet_bulb(precip_type_grid_high, lat_vals, lon_vals)
+
+            wet_bulb = np.where(np.isnan(wb_low), wb_high, wb_low)
+            mask = ~np.isnan(wb_low) & ~np.isnan(wb_high)
+            wet_bulb[mask] = (1.0 - alpha) * wb_low[mask] + alpha * wb_high[mask]
+
             merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
+            merged_values = smooth_grid(merged_values, passes=2)
+            merged_values = np.where(merged_values >= 0.05, merged_values, 0.0).astype(np.float32)
+
             overview_tile = build_overview_tile(lon_vals, lat_vals, merged_values)
             if overview_tile:
                 entries.append((overview_tile_key(pack_lat_start, pack_lon_start), overview_tile))
-        pack_path = os.path.join(product_dir, pack_filename(product_id, 0, pack_lat_start, pack_lon_start))
+
+        pack_path = os.path.join(product_dir, pack_filename_minutes(product_id, forecast_offset_minutes, pack_lat_start, pack_lon_start))
         write_tile_pack(pack_path, entries)
         pack_count += 1
 
@@ -2502,21 +2707,72 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             results.append(result)
             result_ids.add(result["id"])
 
-    precip_type_grid: Optional[PrecipTypeGrid] = None
-    precip_type_error: Optional[str] = None
-    try:
-        precip_type_grid = fetch_gfs_precip_type_grid(client)
-    except Exception as exc:
-        precip_type_error = str(exc)
+    # 1. Fetch GFS forecast grids (wet-bulb temperature and precip rate) for f000, f003, f006
+    gfs_grids = {}
+    gfs_errors = {}
+    for h in (0, 3, 6):
+        try:
+            gfs_grids[h] = fetch_gfs_forecast_grids(client, h)
+        except Exception as exc:
+            gfs_errors[h] = str(exc)
 
+    # Bounding GFS data for hour 0
+    precip_type_grid = gfs_grids[0][1] if 0 in gfs_grids else None
+    precip_type_error = gfs_errors.get(0)
+
+    # 2. Generate tiles for all 10-minute forecast offsets (0 to 240 mins)
+    offsets = [i * 10 for i in range(25)] # 0, 10, ..., 240 mins
+
+    # Store the results for offset 0 to return in the manifest
     scalar_results = []
-    for product_id in (RADAR_RAIN_RATE_ID, RADAR_SNOW_RATE_ID, RADAR_MIXED_RATE_ID, RADAR_PRECIP_RATE_ID):
-        product_precip_type_grid = precip_type_grid if product_id != RADAR_PRECIP_RATE_ID else None
-        result = generate_scalar_precip_tiles(active_grids, product_id, product_precip_type_grid)
-        if precip_type_error and product_id != RADAR_PRECIP_RATE_ID:
-            result["metadata"]["precip_type_error"] = precip_type_error
-        scalar_results.append(result)
-        result_ids.add(result["id"])
+
+    for offset in offsets:
+        # Determine GFS bounding hours, alpha (interpolation), and blend_obs_factor
+        if offset == 0:
+            gfs_low_precip = gfs_grids[0][0] if 0 in gfs_grids else None
+            gfs_low_type = gfs_grids[0][1] if 0 in gfs_grids else None
+            gfs_high_precip = gfs_grids[0][0] if 0 in gfs_grids else None
+            gfs_high_type = gfs_grids[0][1] if 0 in gfs_grids else None
+            alpha = 0.0
+            blend_obs_factor = 1.0
+        elif offset < 180:
+            gfs_low_precip = gfs_grids[0][0] if 0 in gfs_grids else None
+            gfs_low_type = gfs_grids[0][1] if 0 in gfs_grids else None
+            gfs_high_precip = gfs_grids[3][0] if 3 in gfs_grids else None
+            gfs_high_type = gfs_grids[3][1] if 3 in gfs_grids else None
+            alpha = offset / 180.0
+            # Blend out observations over 60 minutes
+            blend_obs_factor = max(0.0, 1.0 - (offset / 60.0))
+        else: # 180 to 240
+            gfs_low_precip = gfs_grids[3][0] if 3 in gfs_grids else None
+            gfs_low_type = gfs_grids[3][1] if 3 in gfs_grids else None
+            gfs_high_precip = gfs_grids[6][0] if 6 in gfs_grids else None
+            gfs_high_type = gfs_grids[6][1] if 6 in gfs_grids else None
+            alpha = (offset - 180) / 180.0
+            blend_obs_factor = 0.0
+
+        for product_id in (RADAR_RAIN_RATE_ID, RADAR_SNOW_RATE_ID, RADAR_MIXED_RATE_ID, RADAR_PRECIP_RATE_ID):
+            pt_low = gfs_low_type if product_id != RADAR_PRECIP_RATE_ID else None
+            pt_high = gfs_high_type if product_id != RADAR_PRECIP_RATE_ID else None
+
+            result = generate_scalar_precip_tiles(
+                active_grids=active_grids,
+                product_id=product_id,
+                precip_type_grid_low=pt_low,
+                precip_type_grid_high=pt_high,
+                gfs_grid_low=gfs_low_precip,
+                gfs_grid_high=gfs_high_precip,
+                alpha=alpha,
+                blend_obs_factor=blend_obs_factor,
+                forecast_offset_minutes=offset,
+            )
+
+            if offset == 0:
+                if precip_type_error and product_id != RADAR_PRECIP_RATE_ID:
+                    result["metadata"]["precip_type_error"] = precip_type_error
+                scalar_results.append(result)
+                result_ids.add(result["id"])
+
     results = scalar_results + results
 
     manifest = {
