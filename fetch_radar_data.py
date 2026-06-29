@@ -61,6 +61,80 @@ OPERA_NIMBUS_PRODUCT_URL = "https://www.eumetnet.eu/wp-content/uploads/2024/06/N
 OPERA_NIMBUS_RAIN_RATE_PREFIX = "T_PAAH22_C_EUOC_"
 OPERA_CIRRUS_REFLECTIVITY_PREFIX = "T_PABV21_C_EUOC_"
 
+ACTIVE_BUILTIN_RADAR_PROVIDER_IDS = {
+    "radar_north_america_mrms",
+    "radar_us_iem_nexrad",
+    "radar_canada_configured",
+    "radar_europe_opera_cirrus",
+    "radar_australia_bom",
+    "radar_japan_configured",
+}
+
+RADAR_PIPELINE_CONTEXT = {
+    "active_builtin_fetchers": [
+        "NOAA MRMS rain-rate GRIB2 for North America",
+        "IEM/NOAA NEXRAD current raster fallback for the United States",
+        "ECCC/MSC GeoMet WMS for Canada",
+        "EUMETNET OPERA/CIRRUS public reflectivity imagery for Europe",
+        "BoM national radar mosaic FTP image for Australia",
+        "JMA hrpns nowcast raster tiles for Japan",
+    ],
+    "catalog_only_provider_note": (
+        "CONFIGURABLE_RADAR_REGIONS and ADDITIONAL_CONFIGURABLE_REGION_SOURCES are source references. "
+        "They are not fetched unless a matching RADAR_PROVIDERS_JSON entry supplies an image/WMS endpoint "
+        "and index_values or color_values."
+    ),
+    "rainviewer_style_gap": {
+        "aggregation": "RainViewer-style coverage comes from many national and station radar feeds composited together, not one global radar feed.",
+        "delivery": "RainViewer serves pre-rendered map tiles; this fetcher decodes source products into Gusty numeric grid packs.",
+        "nowcasting": "This fetcher currently publishes the latest observation frame plus GFS fallback. It does not persist multiple observed frames for optical-flow nowcasting.",
+    },
+    "quality_notes": [
+        "GFS PRATE is a coarse model fallback and should not be presented as live observed radar.",
+        "OPERA/CIRRUS is a lossy reflectivity image path; OPERA NIMBUS rain-rate ODIM HDF5 or COG would be the cleaner European source.",
+        "MRMS native resolution is finer than the default Gusty output grid; RADAR_TARGET_DEGREES and MRMS_TARGET_DEGREES control the downsampling tradeoff.",
+        "BoM IDR00004 is a national mosaic; per-site BoM radar products may provide better local detail.",
+    ],
+}
+
+RADAR_IMPROVEMENT_PRIORITIES = [
+    {
+        "rank": 1,
+        "id": "activate_dwd_knmi",
+        "title": "Activate DWD and KNMI numeric/open composites",
+        "impact": "Cleaner European coverage with less palette-matching fragility.",
+        "status": "not_implemented",
+    },
+    {
+        "rank": 2,
+        "id": "replace_opera_cirrus_with_nimbus",
+        "title": "Use OPERA NIMBUS when a reachable rolling endpoint is available",
+        "impact": "Direct quantitative rain rate across much of Europe.",
+        "status": "blocked_on_endpoint",
+    },
+    {
+        "rank": 3,
+        "id": "persist_multiframe_history",
+        "title": "Persist recent observation frames per provider",
+        "impact": "Required input for observation-based nowcasting.",
+        "status": "not_implemented",
+    },
+    {
+        "rank": 4,
+        "id": "add_optical_flow_nowcast",
+        "title": "Add short-range radar extrapolation from recent frames",
+        "impact": "Closes the biggest perceived smoothness/live-motion gap versus RainViewer-style products.",
+        "status": "blocked_on_multiframe_history",
+    },
+    {
+        "rank": 5,
+        "id": "country_provider_activation",
+        "title": "Activate additional country providers one by one",
+        "impact": "Wider observed-radar coverage where official machine-readable feeds or stable image palettes exist.",
+        "status": "manual_endpoint_work_required",
+    },
+]
+
 CONFIGURABLE_RADAR_REGIONS = [
     {
         "id": "radar_uk_configured",
@@ -537,6 +611,21 @@ def candidate_urls(region: str, provider_url: str) -> List[str]:
         if url not in urls:
             urls.append(url)
     return urls
+
+
+def provider_integration_status(provider_id: str) -> str:
+    if provider_id in ACTIVE_BUILTIN_RADAR_PROVIDER_IDS:
+        return "active_builtin_fetcher"
+    return "external_configured_fetcher"
+
+
+def configured_provider_status(template: Dict[str, Any]) -> str:
+    if template["id"] in ACTIVE_BUILTIN_RADAR_PROVIDER_IDS:
+        return "active_builtin_fetcher"
+    endpoint = provider_endpoint(template["region"])
+    if endpoint.get("machine_readable"):
+        return "candidate_machine_readable"
+    return "catalog_only_source_reference"
 
 TILE_SIZE = 20
 PACK_LAT_SIZE = 60
@@ -1462,9 +1551,9 @@ def rgba_to_color_ramp_values(image: Image.Image, ramp: List[Tuple[float, str]])
     if not np.any(mask):
         return output
 
-    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int16)
+    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int32)
     values = np.array([value for value, _ in ramp], dtype=np.float32)
-    pixels = rgba[:, :, :3][mask].astype(np.int16)
+    pixels = rgba[:, :, :3][mask].astype(np.int32)
     distances = np.sum((pixels[:, None, :] - colors[None, :, :]) ** 2, axis=2)
     output[mask] = values[np.argmin(distances, axis=1)]
     return np.where(output < RADAR_MIN_VALUE, 0.0, output).astype(np.float32)
@@ -1485,9 +1574,9 @@ def rgba_to_threshold_ramp_values(
     if not np.any(mask):
         return output
 
-    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int16)
+    colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int32)
     values = np.array([value for value, _ in ramp], dtype=np.float32)
-    pixels = rgba[:, :, :3][mask].astype(np.int16)
+    pixels = rgba[:, :, :3][mask].astype(np.int32)
     distances = np.sum((pixels[:, None, :] - colors[None, :, :]) ** 2, axis=2)
     closest = np.argmin(distances, axis=1)
     accepted = distances[np.arange(len(closest)), closest] <= max_color_distance
@@ -1615,7 +1704,7 @@ def fetch_australia_bom_radar(client: requests.Session) -> Optional[RadarGrid]:
             ftp.quit()
             return None
         latest_filename = matching[-1]
-        
+
         # Extract timestamp from filename e.g. IDR00004.T.202606291338.png -> 202606291338
         ts_part = latest_filename.split(".")[-2][1:]
         ref_time = dt.datetime.strptime(ts_part, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc).isoformat()
@@ -2005,7 +2094,21 @@ def filter_radar_noise(values: np.ndarray) -> np.ndarray:
 
 def apply_precip_type(values: np.ndarray, wet_bulb_c: Optional[np.ndarray], product_id: str) -> np.ndarray:
     if product_id == RADAR_PRECIP_RATE_ID:
-        return values
+        if wet_bulb_c is None:
+            return values
+        # Encode precipitation types: rain (positive), snow (negative), mixed (+1000.0)
+        is_snow = wet_bulb_c <= PRECIP_TYPE_SNOW_WET_BULB_C
+        is_mixed = (wet_bulb_c > PRECIP_TYPE_SNOW_WET_BULB_C) & (wet_bulb_c <= PRECIP_TYPE_RAIN_WET_BULB_C)
+        is_rain = wet_bulb_c > PRECIP_TYPE_RAIN_WET_BULB_C
+
+        finite = np.isfinite(wet_bulb_c)
+        encoded = np.zeros(values.shape, dtype=np.float32)
+        encoded = np.where(finite & is_snow, -values, encoded)
+        encoded = np.where(finite & is_mixed, values + 1000.0, encoded)
+        encoded = np.where(finite & is_rain, values, encoded)
+        encoded = np.where(~finite, values, encoded)
+        return encoded.astype(np.float32)
+
     if wet_bulb_c is None:
         return values if product_id == RADAR_RAIN_RATE_ID else np.zeros(values.shape, dtype=np.float32)
     if product_id == RADAR_SNOW_RATE_ID:
@@ -2109,6 +2212,8 @@ def generate_scalar_precip_tiles(
             "path": product_id,
             "attribution": None,
             "source_url": RADAR_SOURCE_REFERENCE,
+            "forecast_offset_minutes": forecast_offset_minutes,
+            "data_role": "radar_observation_with_model_fallback",
             "tile_format": TILE_FORMAT,
             "pack_format": PACK_FORMAT,
             "metadata": {
@@ -2119,6 +2224,10 @@ def generate_scalar_precip_tiles(
                 "overview_reduction": "max",
                 "precip_type": precip_type,
                 "noise_floor_mm_h": RADAR_NOISE_FLOOR_MM_H,
+                "forecast_offset_minutes": forecast_offset_minutes,
+                "observation_blend_factor": blend_obs_factor,
+                "gfs_fallback_active": has_gfs,
+                "nowcast_method": None,
             },
         }
 
@@ -2204,12 +2313,12 @@ def generate_scalar_precip_tiles(
         mask = ~np.isnan(wb_low) & ~np.isnan(wb_high)
         wet_bulb[mask] = (1.0 - alpha) * wb_low[mask] + alpha * wb_high[mask]
 
-        # E. Typing, smoothing, noise ceiling
-        merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
+        # E. Smoothing, noise ceiling, typing
         merged_values = smooth_grid(merged_values, passes=2)
         merged_values = np.where(merged_values >= 0.05, merged_values, 0.0).astype(np.float32)
-        if float(np.nanmax(merged_values)) <= 0:
+        if float(np.nanmax(merged_values)) <= 0.0:
             continue
+        merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
 
         dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else -RADAR_TARGET_DEGREES
         dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else RADAR_TARGET_DEGREES
@@ -2277,9 +2386,9 @@ def generate_scalar_precip_tiles(
             mask = ~np.isnan(wb_low) & ~np.isnan(wb_high)
             wet_bulb[mask] = (1.0 - alpha) * wb_low[mask] + alpha * wb_high[mask]
 
-            merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
             merged_values = smooth_grid(merged_values, passes=2)
             merged_values = np.where(merged_values >= 0.05, merged_values, 0.0).astype(np.float32)
+            merged_values = apply_precip_type(merged_values, wet_bulb, product_id)
 
             overview_tile = build_overview_tile(lon_vals, lat_vals, merged_values)
             if overview_tile:
@@ -2308,6 +2417,8 @@ def generate_scalar_precip_tiles(
         "attribution": " / ".join(attributions) if attributions else None,
         "source_url": RADAR_SOURCE_REFERENCE,
         "provider_url": RADAR_SOURCE_REFERENCE,
+        "forecast_offset_minutes": forecast_offset_minutes,
+        "data_role": "radar_observation_with_model_fallback" if has_gfs else "radar_observation",
         "tile_format": TILE_FORMAT,
         "pack_format": PACK_FORMAT,
         "metadata": {
@@ -2323,6 +2434,12 @@ def generate_scalar_precip_tiles(
             "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid_low else "untyped fallback",
             "precip_type_ref_time": precip_type_grid_low.ref_time if precip_type_grid_low else None,
             "precip_type_source_url": precip_type_grid_low.source_url if precip_type_grid_low else None,
+            "forecast_offset_minutes": forecast_offset_minutes,
+            "observation_blend_factor": blend_obs_factor,
+            "gfs_fallback_active": has_gfs,
+            "gfs_fallback_note": "GFS PRATE fills areas outside active radar coverage and any non-observed forecast offsets.",
+            "nowcast_method": None,
+            "nowcast_note": RADAR_PIPELINE_CONTEXT["rainviewer_style_gap"]["nowcasting"],
             "wet_bulb_thresholds_c": {
                 "snow_lte": PRECIP_TYPE_SNOW_WET_BULB_C,
                 "mixed_gt": PRECIP_TYPE_SNOW_WET_BULB_C,
@@ -2437,6 +2554,8 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
         "source_url": grid.source_url,
         "provider_url": grid.source_url,
         "candidate_urls": candidate_urls(grid.region, grid.source_url),
+        "integration_status": provider_integration_status(grid.provider_id),
+        "data_role": "radar_observation",
         **provider_endpoint(grid.region),
         "tile_format": TILE_FORMAT,
         "pack_format": PACK_FORMAT,
@@ -2449,6 +2568,8 @@ def generate_tiles(grid: RadarGrid) -> Dict[str, Any]:
             "target_degrees": grid.target_degrees,
             "client_coloring": True,
             "recommended_color_stops": RADAR_COLOR_STOPS,
+            "integration_status": provider_integration_status(grid.provider_id),
+            "data_role": "radar_observation",
         },
     }
 
@@ -2475,6 +2596,8 @@ def provider_error(provider_id: str, name: str, region: str, source_url: str, at
         "source_url": source_url,
         "provider_url": source_url,
         "candidate_urls": candidate_urls(region, source_url),
+        "integration_status": provider_integration_status(provider_id),
+        "data_role": "radar_observation",
         **provider_endpoint(region),
     }
 
@@ -2501,9 +2624,15 @@ def configuration_pending_manifest(template: Dict[str, Any]) -> Dict[str, Any]:
         "source_url": template["source_url"],
         "provider_url": template["source_url"],
         "candidate_urls": candidates,
+        "integration_status": configured_provider_status(template),
+        "data_role": "source_reference",
         **endpoint,
         "bounds": REGION_BOUNDS.get(template["region"]),
         "notes": template["notes"],
+        "metadata": {
+            "activation_note": RADAR_PIPELINE_CONTEXT["catalog_only_provider_note"],
+            "integration_status": configured_provider_status(template),
+        },
     }
 
 
@@ -2547,6 +2676,9 @@ def layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "source_url": result.get("source_url"),
                 "provider_url": result.get("provider_url") or result.get("source_url"),
                 "candidate_urls": result.get("candidate_urls"),
+                "integration_status": result.get("integration_status"),
+                "data_role": result.get("data_role"),
+                "forecast_offset_minutes": result.get("forecast_offset_minutes"),
                 "endpoint_url": result.get("endpoint_url"),
                 "endpoint_type": result.get("endpoint_type"),
                 "machine_readable": result.get("machine_readable"),
@@ -2586,6 +2718,8 @@ def vector_layer_entries(provider_results: List[Dict[str, Any]]) -> Dict[str, An
                 "attribution": result.get("attribution"),
                 "source_url": result.get("source_url"),
                 "provider_url": result.get("provider_url") or result.get("source_url"),
+                "integration_status": result.get("integration_status"),
+                "data_role": result.get("data_role"),
                 "preferred_raw_product": result.get("preferred_raw_product"),
                 "reflectivity_product": result.get("reflectivity_product"),
                 "vector_tile_format": result.get("vector_tile_format", VECTOR_TILE_FORMAT),
@@ -2603,6 +2737,8 @@ def provider_catalog() -> Dict[str, Any]:
         "reference_basis": RADAR_SOURCE_REFERENCE,
         "value_parameter": RADAR_VALUE_PARAMETER,
         "value_units": RADAR_VALUE_UNITS,
+        "pipeline_context": RADAR_PIPELINE_CONTEXT,
+        "improvement_priorities": RADAR_IMPROVEMENT_PRIORITIES,
         "providers": [
             {
                 "id": template["id"],
@@ -2613,6 +2749,8 @@ def provider_catalog() -> Dict[str, Any]:
                 "source_url": template["source_url"],
                 "provider_url": template["source_url"],
                 "candidate_urls": candidate_urls(template["region"], template["source_url"]),
+                "integration_status": configured_provider_status(template),
+                "data_role": "source_reference",
                 **provider_endpoint(template["region"]),
                 "notes": template["notes"],
             }
@@ -2857,8 +2995,8 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             blend_obs_factor = 0.0
 
         for product_id in (RADAR_RAIN_RATE_ID, RADAR_SNOW_RATE_ID, RADAR_MIXED_RATE_ID, RADAR_PRECIP_RATE_ID):
-            pt_low = gfs_low_type if product_id != RADAR_PRECIP_RATE_ID else None
-            pt_high = gfs_high_type if product_id != RADAR_PRECIP_RATE_ID else None
+            pt_low = gfs_low_type
+            pt_high = gfs_high_type
 
             result = generate_scalar_precip_tiles(
                 active_grids=active_grids,
@@ -2873,12 +3011,14 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             )
 
             if offset == 0:
-                if precip_type_error and product_id != RADAR_PRECIP_RATE_ID:
+                if precip_type_error:
                     result["metadata"]["precip_type_error"] = precip_type_error
                 scalar_results.append(result)
                 result_ids.add(result["id"])
 
     results = scalar_results + results
+    active_observation_provider_ids = [grid.provider_id for grid in active_grids]
+    active_observation_regions = sorted({grid.region for grid in active_grids})
 
     manifest = {
         "generated_at": now_iso(),
@@ -2887,6 +3027,8 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         "reference_basis": RADAR_SOURCE_REFERENCE,
         "value_parameter": RADAR_VALUE_PARAMETER,
         "value_units": RADAR_VALUE_UNITS,
+        "pipeline_context": RADAR_PIPELINE_CONTEXT,
+        "improvement_priorities": RADAR_IMPROVEMENT_PRIORITIES,
         "recommended_color_stops": RADAR_COLOR_STOPS,
         "dark_sky_color_stops": {
             "rain": DARK_SKY_RAIN_COLOR_STOPS,
@@ -2896,6 +3038,11 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
         "precip_type_source": "GFS 2m wet-bulb temperature" if precip_type_grid else None,
         "precip_type_error": precip_type_error,
         "configured_provider_count": len(configured_specs),
+        "catalog_provider_count": len(CONFIGURABLE_RADAR_REGIONS),
+        "active_builtin_fetcher_count": len(ACTIVE_BUILTIN_RADAR_PROVIDER_IDS),
+        "active_observation_provider_count": len(active_observation_provider_ids),
+        "active_observation_provider_ids": active_observation_provider_ids,
+        "active_observation_regions": active_observation_regions,
         "providers": results,
     }
     write_json(os.path.join(RADAR_DIR, "manifest.json"), manifest)
