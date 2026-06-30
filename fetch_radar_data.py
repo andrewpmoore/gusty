@@ -143,6 +143,7 @@ REGION_BOUNDS = {
     "Canada": (-141.0, 41.5, -52.5, 83.5),
     "United States": (-126.0, 24.0, -66.0, 50.0),
     "Germany": (4.5, 46.8, 15.5, 55.5),
+    "Finland": (18.0, 58.0, 33.5, 71.5),
     "Japan": (122.8, 24.0, 146.1, 46.1),
 }
 
@@ -155,6 +156,10 @@ NOAA_GFS_FILTER_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 DWD_RADAR_RV_URL = "https://opendata.dwd.de/weather/radar/composite/rv/"
 DWD_RADAR_RS_URL = "https://opendata.dwd.de/weather/radar/composite/rs/"
 DWD_SOURCE_URL = "https://opendata.dwd.de/weather/radar/composite/"
+FMI_WMS_URL = "https://openwms.fmi.fi/geoserver/wms"
+FMI_OPEN_DATA_URL = "https://en.ilmatieteenlaitos.fi/open-data"
+FMI_LICENSE_URL = "https://en.ilmatieteenlaitos.fi/open-data-licence"
+FMI_RAIN_RATE_LAYER = "Radar:radar_finland_cappi_rate"
 JMA_NOWCAST_TIMES_URL = "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json"
 JMA_NOWCAST_TILE_TEMPLATE = (
     "https://www.jma.go.jp/bosai/jmatile/data/nowc/{base_time}/none/"
@@ -185,6 +190,23 @@ ECCC_SNOW_RAMP = [
     (4.0, "#1584d1"),
     (8.0, "#075aaa"),
     (16.0, "#063970"),
+]
+FMI_RAIN_RAMP = [
+    (0.0, "#e5d3f7"),
+    (0.1, "#cbbef4"),
+    (0.5, "#aeaef2"),
+    (1.0, "#93a7f0"),
+    (2.5, "#7db0ef"),
+    (5.0, "#64c4ee"),
+    (7.5, "#58dee2"),
+    (10.0, "#95ed8d"),
+    (15.0, "#e0df2b"),
+    (20.0, "#e1be12"),
+    (25.0, "#cf930b"),
+    (30.0, "#ba6d08"),
+    (40.0, "#a64b05"),
+    (65.0, "#8f2f03"),
+    (100.0, "#781501"),
 ]
 JMA_HRPNS_COLOR_VALUES = {
     "#f2f2ff": 0.5,
@@ -411,10 +433,15 @@ def normalize_hex_color(value: str) -> Tuple[int, int, int]:
     return int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16)
 
 
-def rgba_to_color_ramp_values(image: Image.Image, ramp: Sequence[Tuple[float, str]], max_color_distance: Optional[int] = None) -> np.ndarray:
+def rgba_to_color_ramp_values(
+    image: Image.Image,
+    ramp: Sequence[Tuple[float, str]],
+    max_color_distance: Optional[int] = None,
+    alpha_threshold: int = 1,
+) -> np.ndarray:
     rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
     output = np.zeros(rgba.shape[:2], dtype=np.float32)
-    mask = rgba[:, :, 3] > 0
+    mask = rgba[:, :, 3] >= alpha_threshold
     if not np.any(mask):
         return output
     colors = np.array([normalize_hex_color(color) for _, color in ramp], dtype=np.int32)
@@ -746,7 +773,8 @@ def create_frame(
     )
 
 
-def wms_url(
+def wms_get_map_url(
+    service_url: str,
     layer: str,
     bounds: Tuple[float, float, float, float],
     *,
@@ -771,7 +799,27 @@ def wms_url(
     }
     if time_value:
         params["TIME"] = time_value
-    return f"{ECCC_GEOMET_URL}?{urlencode(params)}"
+    return f"{service_url}?{urlencode(params)}"
+
+
+def wms_url(
+    layer: str,
+    bounds: Tuple[float, float, float, float],
+    *,
+    style: str = "",
+    width: int = 1800,
+    height: int = 1000,
+    time_value: Optional[str] = None,
+) -> str:
+    return wms_get_map_url(
+        ECCC_GEOMET_URL,
+        layer,
+        bounds,
+        style=style,
+        width=width,
+        height=height,
+        time_value=time_value,
+    )
 
 
 def fetch_eccc_geomet(client: requests.Session) -> ProviderResult:
@@ -1216,6 +1264,62 @@ def fetch_dwd_open_data(client: requests.Session) -> ProviderResult:
     )
 
 
+def fetch_fmi_open_data(client: requests.Session) -> ProviderResult:
+    provider_id = "fmi_open_data"
+    bounds = REGION_BOUNDS["Finland"]
+    width = int(os.getenv("FMI_RADAR_WIDTH", "1100") or "1100")
+    height = int(os.getenv("FMI_RADAR_HEIGHT", "1200") or "1200")
+    url = wms_get_map_url(
+        FMI_WMS_URL,
+        FMI_RAIN_RATE_LAYER,
+        bounds,
+        width=width,
+        height=height,
+    )
+    image_bytes, ref_time = get_bytes(client, url)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        values = rgba_to_color_ramp_values(image, FMI_RAIN_RAMP, alpha_threshold=64)
+
+    west, south, east, north = bounds
+    x_pixel_size = (east - west) / max(values.shape[1] - 1, 1)
+    y_pixel_size = (south - north) / max(values.shape[0] - 1, 1)
+    values, latitudes, longitudes = sample_grid(values, x_pixel_size, y_pixel_size, west, north)
+    frame = create_frame(
+        provider_id=provider_id,
+        name="FMI Open Data Finland Radar",
+        valid_time=ref_time,
+        lead_minutes=0,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        rain=values,
+        snow=None,
+        mixed=None,
+        attribution="Finnish Meteorological Institute / FMI Open Data",
+        source_url=FMI_OPEN_DATA_URL,
+        source_kind="wms-radar-rain-rate",
+        metadata={
+            "requested_url": url,
+            "license": "CC BY 4.0",
+            "license_url": FMI_LICENSE_URL,
+            "wms_layer": FMI_RAIN_RATE_LAYER,
+        },
+    )
+    return ProviderResult(
+        id=provider_id,
+        name="FMI Open Data Finland Radar",
+        status="ok",
+        source_url=FMI_OPEN_DATA_URL,
+        attribution="Finnish Meteorological Institute / FMI Open Data",
+        frames=[frame],
+        metadata={
+            "anonymous": True,
+            "license": "CC BY 4.0",
+            "license_url": FMI_LICENSE_URL,
+            "wms_layer": FMI_RAIN_RATE_LAYER,
+        },
+    )
+
+
 def lon_to_tile_x(lon: float, zoom: int) -> int:
     return int(math.floor((lon + 180.0) / 360.0 * (2**zoom)))
 
@@ -1462,6 +1566,7 @@ def fetch_all_providers(client: requests.Session) -> List[ProviderResult]:
         ("noaa_mrms", "NOAA MRMS Precipitation Rate", NOAA_MRMS_DOCS_URL, "NOAA MRMS / AWS Open Data", fetch_noaa_mrms),
         ("noaa_gfs", "NOAA GFS Short-Range Precipitation Fallback", "https://nomads.ncep.noaa.gov/", "NOAA GFS / NOMADS", fetch_noaa_gfs_provider),
         ("dwd_open_data", "DWD Open Data Radar Composite", DWD_SOURCE_URL, "Deutscher Wetterdienst / DWD Open Data", fetch_dwd_open_data),
+        ("fmi_open_data", "FMI Open Data Finland Radar", FMI_OPEN_DATA_URL, "Finnish Meteorological Institute / FMI Open Data", fetch_fmi_open_data),
         ("jma_nowcast", "JMA Nowcast Radar", "https://www.jma.go.jp/jp/radnowc/index.html", "Japan Meteorological Agency", fetch_jma_nowcast),
     ]
     results: List[ProviderResult] = []
@@ -1899,6 +2004,21 @@ def provider_catalog() -> Dict[str, Any]:
                 "free": True,
                 "registration_required": False,
                 "source_url": DWD_SOURCE_URL,
+            },
+            {
+                "id": "fmi_open_data",
+                "name": "FMI Open Data Finland radar rain rate",
+                "coverage": "Finland and nearby northern Europe",
+                "free": True,
+                "registration_required": False,
+                "source_url": FMI_OPEN_DATA_URL,
+                "license": "CC BY 4.0",
+                "license_url": FMI_LICENSE_URL,
+                "metadata": {
+                    "wms_url": FMI_WMS_URL,
+                    "wms_layer": FMI_RAIN_RATE_LAYER,
+                    "native_kind": "WMS radar rain-rate image",
+                },
             },
             {
                 "id": "jma_nowcast",

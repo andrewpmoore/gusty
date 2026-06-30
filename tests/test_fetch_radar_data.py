@@ -2,8 +2,10 @@ import os
 import sys
 import tempfile
 import unittest
+from io import BytesIO
 
 import numpy as np
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -109,6 +111,29 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         np.testing.assert_allclose(frame.rain_mm_h, np.full((2, 2), 4.0))
         np.testing.assert_allclose(frame.snow_mm_h, np.full((2, 2), 2.0))
         self.assertEqual(frame.metadata["interpolated_from_minutes"], [60, 120])
+
+    def test_fmi_open_data_normalizes_wms_rain_rate(self):
+        image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+        image.putpixel((0, 0), (100, 196, 238, 255))
+        image.putpixel((1, 0), (120, 21, 1, 255))
+        payload = BytesIO()
+        image.save(payload, format="PNG")
+
+        original_get_bytes = radar.get_bytes
+        try:
+            radar.get_bytes = lambda _client, _url: (payload.getvalue(), "2026-06-29T00:00:00+00:00")
+            result = radar.fetch_fmi_open_data(None)
+        finally:
+            radar.get_bytes = original_get_bytes
+
+        self.assertEqual(result.id, "fmi_open_data")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.metadata["license"], "CC BY 4.0")
+        self.assertEqual(len(result.frames), 1)
+        frame = result.frames[0]
+        self.assertEqual(frame.lead_minutes, 0)
+        self.assertGreater(float(np.nanmax(frame.rain_mm_h)), 50.0)
+        self.assertGreater(int(np.count_nonzero(frame.rain_mm_h == 0.0)), 0)
 
 
 if __name__ == "__main__":
