@@ -135,6 +135,74 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         self.assertGreater(float(np.nanmax(frame.rain_mm_h)), 50.0)
         self.assertGreater(int(np.count_nonzero(frame.rain_mm_h == 0.0)), 0)
 
+    def test_registry_provider_must_be_enabled(self):
+        payload = {
+            "providers": [
+                {
+                    "id": "disabled_fixture",
+                    "name": "Disabled Fixture",
+                    "enabled": False,
+                    "bounds": [0, 0, 1, 1],
+                    "image_url": "https://example.com/radar.png",
+                    "color_values": {"#ffffff": 1.0},
+                    "redistribution": {"allowed": True, "license": "Fixture"},
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            import json
+
+            json.dump(payload, handle)
+            handle.flush()
+            original_file = radar.RADAR_PROVIDER_REGISTRY_FILE
+            original_url = radar.RADAR_PROVIDER_REGISTRY_URL
+            try:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = handle.name
+                radar.RADAR_PROVIDER_REGISTRY_URL = ""
+                os.environ.pop("RADAR_PROVIDERS_JSON", None)
+                results = radar.fetch_configured_providers(None)
+            finally:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = original_file
+                radar.RADAR_PROVIDER_REGISTRY_URL = original_url
+
+        self.assertEqual(results[0].id, "disabled_fixture")
+        self.assertEqual(results[0].status, "skipped")
+
+    def test_registry_provider_requires_redistribution_permission(self):
+        payload = {
+            "providers": [
+                {
+                    "id": "blocked_fixture",
+                    "name": "Blocked Fixture",
+                    "enabled": True,
+                    "bounds": [0, 0, 1, 1],
+                    "image_url": "https://example.com/radar.png",
+                    "color_values": {"#ffffff": 1.0},
+                    "redistribution": {"allowed": False, "license": "Needs permission"},
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            import json
+
+            json.dump(payload, handle)
+            handle.flush()
+            original_file = radar.RADAR_PROVIDER_REGISTRY_FILE
+            original_url = radar.RADAR_PROVIDER_REGISTRY_URL
+            try:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = handle.name
+                radar.RADAR_PROVIDER_REGISTRY_URL = ""
+                os.environ.pop("RADAR_PROVIDERS_JSON", None)
+                results = radar.fetch_configured_providers(None)
+            finally:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = original_file
+                radar.RADAR_PROVIDER_REGISTRY_URL = original_url
+
+        self.assertEqual(results[0].id, "blocked_fixture")
+        self.assertEqual(results[0].status, "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

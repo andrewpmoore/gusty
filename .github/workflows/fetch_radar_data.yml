@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'fetch_radar_data.py'
+      - 'radar_provider_registry.json'
       - 'radar_providers.example.json'
       - 'requirements.txt'
       - '.github/workflows/fetch_radar_data.yml'
@@ -49,6 +50,7 @@ jobs:
           RADAR_MIN_VALUE: ${{ vars.RADAR_MIN_VALUE }}
           RADAR_NOISE_FLOOR_MM_H: ${{ vars.RADAR_NOISE_FLOOR_MM_H }}
           RADAR_EDGE_THRESHOLD_MM_H: ${{ vars.RADAR_EDGE_THRESHOLD_MM_H }}
+          RADAR_PROVIDER_REGISTRY_URL: ${{ vars.RADAR_PROVIDER_REGISTRY_URL }}
           RADAR_ENABLE_GLOBAL_MODEL_FALLBACK: ${{ vars.RADAR_ENABLE_GLOBAL_MODEL_FALLBACK || 'true' }}
           NOAA_GFS_FORECAST_HOURS: ${{ vars.NOAA_GFS_FORECAST_HOURS || '0,1,2' }}
           METOFFICE_DATAHUB_API_KEY: ${{ secrets.METOFFICE_DATAHUB_API_KEY }}

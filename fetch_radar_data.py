@@ -41,6 +41,8 @@ FORECAST_OFFSETS_MINUTES = [0, 15, 30, 45, 60, 75, 90, 105, 120]
 RADAR_SOURCE_REFERENCE = "official and public meteorological radar provider references"
 RADAR_VALUE_PARAMETER = "rain_rate"
 RADAR_VALUE_UNITS = "mm/h"
+RADAR_PROVIDER_REGISTRY_FILE = os.getenv("RADAR_PROVIDER_REGISTRY_FILE", "radar_provider_registry.json")
+RADAR_PROVIDER_REGISTRY_URL = os.getenv("RADAR_PROVIDER_REGISTRY_URL", "").strip()
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1486,11 +1488,7 @@ def configured_values(image_bytes: bytes, spec: Dict[str, Any]) -> np.ndarray:
 
 
 def fetch_configured_providers(client: requests.Session) -> List[ProviderResult]:
-    raw = os.getenv("RADAR_PROVIDERS_JSON", "").strip()
-    if not raw:
-        return []
-    payload = json.loads(raw)
-    specs = payload.get("providers", payload) if isinstance(payload, dict) else payload
+    specs = load_configured_provider_specs(client)
     results = []
     for spec in specs:
         spec = interpolate_env(spec)
@@ -1498,6 +1496,33 @@ def fetch_configured_providers(client: requests.Session) -> List[ProviderResult]
         name = spec.get("name", provider_id)
         attribution = spec.get("attribution", provider_id)
         source_url = spec.get("source_url") or spec.get("image_url") or spec.get("wms_url") or RADAR_SOURCE_REFERENCE
+        metadata = configured_provider_metadata(spec)
+        if not configured_provider_enabled(spec):
+            results.append(
+                ProviderResult(
+                    id=provider_id,
+                    name=name,
+                    status="skipped",
+                    source_url=source_url,
+                    attribution=attribution,
+                    error="Configured provider is not enabled",
+                    metadata=metadata,
+                )
+            )
+            continue
+        if not configured_provider_redistribution_allowed(spec):
+            results.append(
+                ProviderResult(
+                    id=provider_id,
+                    name=name,
+                    status="blocked",
+                    source_url=source_url,
+                    attribution=attribution,
+                    error="Redistribution is not explicitly allowed for this provider",
+                    metadata=metadata,
+                )
+            )
+            continue
         try:
             bounds = parse_bounds(spec.get("bounds"))
             image_url = spec.get("image_url") or configured_wms_url(spec, bounds)
@@ -1521,7 +1546,7 @@ def fetch_configured_providers(client: requests.Session) -> List[ProviderResult]
                 attribution=attribution,
                 source_url=source_url,
                 source_kind="configured-image-or-wms",
-                metadata={"configured": True},
+                metadata=metadata,
             )
             results.append(
                 ProviderResult(
@@ -1531,7 +1556,7 @@ def fetch_configured_providers(client: requests.Session) -> List[ProviderResult]
                     source_url=source_url,
                     attribution=attribution,
                     frames=[frame],
-                    metadata={"configured": True},
+                    metadata=metadata,
                 )
             )
         except Exception as exc:
@@ -1543,10 +1568,79 @@ def fetch_configured_providers(client: requests.Session) -> List[ProviderResult]
                     source_url=source_url,
                     attribution=attribution,
                     error=str(exc),
-                    metadata={"configured": True},
+                    metadata=metadata,
                 )
             )
     return results
+
+
+def provider_specs_from_payload(payload: Any, default_metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    specs = payload.get("providers", payload) if isinstance(payload, dict) else payload
+    if not specs:
+        return []
+    if not isinstance(specs, list):
+        raise ValueError("Configured radar provider registry must be a list or an object with a providers list")
+    output = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            raise ValueError("Each configured radar provider must be an object")
+        merged = dict(spec)
+        if default_metadata:
+            merged.setdefault("_registry", {}).update(default_metadata)
+        output.append(merged)
+    return output
+
+
+def load_configured_provider_specs(client: requests.Session) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+
+    registry_file = RADAR_PROVIDER_REGISTRY_FILE.strip()
+    if registry_file and os.path.exists(registry_file):
+        with open(registry_file, "r", encoding="utf-8") as handle:
+            specs.extend(provider_specs_from_payload(json.load(handle), {"source": registry_file, "strict": True}))
+
+    if RADAR_PROVIDER_REGISTRY_URL:
+        text, _ = get_text(client, RADAR_PROVIDER_REGISTRY_URL)
+        specs.extend(provider_specs_from_payload(json.loads(text), {"source": RADAR_PROVIDER_REGISTRY_URL, "strict": True}))
+
+    raw = os.getenv("RADAR_PROVIDERS_JSON", "").strip()
+    if raw:
+        specs.extend(provider_specs_from_payload(json.loads(raw), {"source": "RADAR_PROVIDERS_JSON", "strict": False}))
+
+    return specs
+
+
+def configured_provider_enabled(spec: Dict[str, Any]) -> bool:
+    if "enabled" in spec:
+        return bool(spec["enabled"])
+    status = str(spec.get("status", "")).lower()
+    if status:
+        return status in {"enabled", "active", "ok"}
+    registry = spec.get("_registry") or {}
+    return not bool(registry.get("strict"))
+
+
+def configured_provider_redistribution_allowed(spec: Dict[str, Any]) -> bool:
+    redistribution = spec.get("redistribution")
+    if isinstance(redistribution, dict):
+        return bool(redistribution.get("allowed"))
+    if "redistribution_allowed" in spec:
+        return bool(spec["redistribution_allowed"])
+    registry = spec.get("_registry") or {}
+    return not bool(registry.get("strict"))
+
+
+def configured_provider_metadata(spec: Dict[str, Any]) -> Dict[str, Any]:
+    redistribution = spec.get("redistribution") if isinstance(spec.get("redistribution"), dict) else {}
+    return {
+        "configured": True,
+        "registry": spec.get("_registry") or {},
+        "license": spec.get("license") or redistribution.get("license"),
+        "license_url": spec.get("license_url") or redistribution.get("license_url"),
+        "redistribution_allowed": configured_provider_redistribution_allowed(spec),
+        "provider_status": spec.get("status"),
+        "notes": spec.get("notes"),
+    }
 
 
 def provider_error(provider_id: str, name: str, source_url: str, attribution: str, exc: Exception) -> ProviderResult:

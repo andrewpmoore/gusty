@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "description": "LibreWXR-style radar source catalog for Gusty. Entries may be documented here before they are enabled; the fetcher only ingests entries with enabled=true and redistribution.allowed=true.",
+  "providers": [
+    {
+      "id": "fmi_open_data_documented",
+      "name": "FMI Open Data Finland radar rain rate",
+      "status": "built_in",
+      "enabled": false,
+      "region": "Finland and nearby northern Europe",
+      "bounds": [18.0, 58.0, 33.5, 71.5],
+      "units": "mm/h",
+      "attribution": "Finnish Meteorological Institute / FMI Open Data",
+      "source_url": "https://en.ilmatieteenlaitos.fi/open-data",
+      "redistribution": {
+        "allowed": true,
+        "license": "CC BY 4.0",
+        "license_url": "https://en.ilmatieteenlaitos.fi/open-data-licence"
+      },
+      "notes": "Implemented as built-in provider fmi_open_data. This catalog entry documents the source and should stay disabled to avoid duplicate ingestion."
+    },
+    {
+      "id": "metoffice_uk_radar_candidate",
+      "name": "Met Office UK rainfall radar candidate",
+      "status": "needs_key_and_terms_review",
+      "enabled": false,
+      "region": "United Kingdom",
+      "required_secret_names": ["METOFFICE_DATAHUB_API_KEY"],
+      "attribution": "Met Office",
+      "source_url": "https://datahub.metoffice.gov.uk/",
+      "redistribution": {
+        "allowed": false,
+        "license": "Unknown until product subscription terms are confirmed"
+      },
+      "notes": "Do not enable until the exact rainfall radar product and redistribution terms are confirmed for Gusty."
+    },
+    {
+      "id": "meteofrance_radar_candidate",
+      "name": "Meteo-France rainfall radar candidate",
+      "status": "needs_key_and_terms_review",
+      "enabled": false,
+      "region": "France",
+      "required_secret_names": ["METEOFRANCE_API_KEY"],
+      "attribution": "Meteo-France",
+      "source_url": "https://portail-api.meteofrance.fr/",
+      "redistribution": {
+        "allowed": false,
+        "license": "Unknown until exact API product terms are confirmed"
+      },
+      "notes": "Keep disabled until the API product endpoint and redistribution licence are verified."
+    },
+    {
+      "id": "aemet_spain_radar_candidate",
+      "name": "AEMET Spain radar candidate",
+      "status": "needs_key_and_terms_review",
+      "enabled": false,
+      "region": "Spain",
+      "required_secret_names": ["AEMET_API_KEY"],
+      "attribution": "AEMET",
+      "source_url": "https://opendata.aemet.es/centrodedescargas/inicio",
+      "redistribution": {
+        "allowed": false,
+        "license": "Unknown until exact product terms are confirmed"
+      },
+      "notes": "Keep disabled until the radar endpoint and redistribution licence are verified."
+    },
+    {
+      "id": "bom_australia_radar_blocked",
+      "name": "Australia BoM radar",
+      "status": "blocked",
+      "enabled": false,
+      "region": "Australia",
+      "attribution": "Bureau of Meteorology",
+      "source_url": "https://www.bom.gov.au/catalogue/data-feeds.shtml",
+      "redistribution": {
+        "allowed": false,
+        "license": "BoM says radar images, high-resolution maps, and specialised data may require a data licence agreement."
+      },
+      "notes": "Do not scrape or republish unless Gusty obtains a data licence agreement."
+    }
+  ]
+}
