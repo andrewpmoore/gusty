@@ -1487,8 +1487,8 @@ def decode_radolan_best_effort(payload: bytes) -> np.ndarray:
     possible_shapes = [(900, 900), (1100, 900), (1200, 1100), (1500, 1400)]
     for rows, cols in possible_shapes:
         if arr.size >= rows * cols:
-            grid = arr[: rows * cols].reshape(rows, cols).astype(np.float32)
-            grid = np.where(grid & 0x1000 > 0, 0.0, grid & 0x0FFF)
+            raw_grid = arr[: rows * cols].reshape(rows, cols)
+            grid = np.where((raw_grid & 0x1000) > 0, 0.0, raw_grid & 0x0FFF)
             return np.clip(grid / 10.0, 0.0, 250.0).astype(np.float32)
     raise ValueError(f"Unsupported RADOLAN payload size: {arr.size}")
 

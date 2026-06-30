@@ -190,6 +190,16 @@ class FetchRadarDataCoreTests(unittest.TestCase):
             "MRMS_MergedReflectivityQCComposite.latest.grib2.gz",
         )
 
+    def test_radolan_decode_applies_bitmask_before_float_conversion(self):
+        raw = np.zeros(900 * 900, dtype="<u2")
+        raw[:4] = [1, 0x1002, 30, 40]
+        payload = b"header\x03" + raw.tobytes()
+
+        values = radar.decode_radolan_best_effort(payload)
+
+        self.assertEqual(values.shape, (900, 900))
+        np.testing.assert_allclose(values[0, :4], [0.1, 0.0, 3.0, 4.0])
+
     def test_fmi_open_data_normalizes_wms_rain_rate(self):
         image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
         image.putpixel((0, 0), (100, 196, 238, 255))

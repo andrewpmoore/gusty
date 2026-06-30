@@ -6,3 +6,4 @@ eccodes
 Pillow
 h5py
 tifffile
+imagecodecs
