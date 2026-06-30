@@ -51,6 +51,8 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+RADAR_ALLOW_UNVERIFIED_PROVIDERS = env_bool("RADAR_ALLOW_UNVERIFIED_PROVIDERS", False)
 TIMEOUT = int(os.getenv("RADAR_HTTP_TIMEOUT", "90"))
 USER_AGENT = os.getenv(
     "GUSTY_USER_AGENT",
@@ -1611,6 +1613,8 @@ def load_configured_provider_specs(client: requests.Session) -> List[Dict[str, A
 
 
 def configured_provider_enabled(spec: Dict[str, Any]) -> bool:
+    if RADAR_ALLOW_UNVERIFIED_PROVIDERS:
+        return True
     if "enabled" in spec:
         return bool(spec["enabled"])
     status = str(spec.get("status", "")).lower()
@@ -1621,6 +1625,8 @@ def configured_provider_enabled(spec: Dict[str, Any]) -> bool:
 
 
 def configured_provider_redistribution_allowed(spec: Dict[str, Any]) -> bool:
+    if RADAR_ALLOW_UNVERIFIED_PROVIDERS:
+        return True
     redistribution = spec.get("redistribution")
     if isinstance(redistribution, dict):
         return bool(redistribution.get("allowed"))
@@ -1638,6 +1644,7 @@ def configured_provider_metadata(spec: Dict[str, Any]) -> Dict[str, Any]:
         "license": spec.get("license") or redistribution.get("license"),
         "license_url": spec.get("license_url") or redistribution.get("license_url"),
         "redistribution_allowed": configured_provider_redistribution_allowed(spec),
+        "unverified_override_active": RADAR_ALLOW_UNVERIFIED_PROVIDERS,
         "provider_status": spec.get("status"),
         "notes": spec.get("notes"),
     }
@@ -2128,7 +2135,12 @@ def provider_catalog() -> Dict[str, Any]:
                 "coverage": "Configured",
                 "free": True,
                 "registration_required": True,
-                "source_url": "RADAR_PROVIDERS_JSON",
+                "source_url": "RADAR_PROVIDER_REGISTRY_FILE / RADAR_PROVIDER_REGISTRY_URL / RADAR_PROVIDERS_JSON",
+                "metadata": {
+                    "registry_file": RADAR_PROVIDER_REGISTRY_FILE,
+                    "registry_url_configured": bool(RADAR_PROVIDER_REGISTRY_URL),
+                    "allow_unverified_providers": RADAR_ALLOW_UNVERIFIED_PROVIDERS,
+                },
                 "supported_secret_names": [
                     "METOFFICE_DATAHUB_API_KEY",
                     "AEMET_API_KEY",
@@ -2184,6 +2196,7 @@ def run(print_summary: bool = False) -> Dict[str, Any]:
             "display_offsets_minutes": FORECAST_OFFSETS_MINUTES,
             "quality_goal": "smooth transparent rain/snow fields comparable to Rainbow.ai map overlays",
             "provider_failure_policy": "provider failures are warnings unless every provider fails",
+            "allow_unverified_providers": RADAR_ALLOW_UNVERIFIED_PROVIDERS,
             "model_fallback_scope": (
                 "global"
                 if ENABLE_GLOBAL_MODEL_FALLBACK

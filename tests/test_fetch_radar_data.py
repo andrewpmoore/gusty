@@ -203,6 +203,55 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         self.assertEqual(results[0].id, "blocked_fixture")
         self.assertEqual(results[0].status, "blocked")
 
+    def test_unverified_override_ingests_disabled_blocked_provider(self):
+        image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+        image.putpixel((0, 0), (255, 255, 255, 255))
+        payload_bytes = BytesIO()
+        image.save(payload_bytes, format="PNG")
+        payload = {
+            "providers": [
+                {
+                    "id": "override_fixture",
+                    "name": "Override Fixture",
+                    "enabled": False,
+                    "bounds": [0, 0, 1, 1],
+                    "image_url": "https://example.com/radar.png",
+                    "color_values": {"#ffffff": 1.0},
+                    "redistribution": {"allowed": False, "license": "Test only"},
+                }
+            ]
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            import json
+
+            json.dump(payload, handle)
+            handle.flush()
+            original_file = radar.RADAR_PROVIDER_REGISTRY_FILE
+            original_url = radar.RADAR_PROVIDER_REGISTRY_URL
+            original_override = radar.RADAR_ALLOW_UNVERIFIED_PROVIDERS
+            original_get_bytes = radar.configured_get_bytes
+            try:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = handle.name
+                radar.RADAR_PROVIDER_REGISTRY_URL = ""
+                radar.RADAR_ALLOW_UNVERIFIED_PROVIDERS = True
+                radar.configured_get_bytes = lambda _client, _url, _spec: (
+                    payload_bytes.getvalue(),
+                    "2026-06-29T00:00:00+00:00",
+                )
+                os.environ.pop("RADAR_PROVIDERS_JSON", None)
+                results = radar.fetch_configured_providers(None)
+            finally:
+                radar.RADAR_PROVIDER_REGISTRY_FILE = original_file
+                radar.RADAR_PROVIDER_REGISTRY_URL = original_url
+                radar.RADAR_ALLOW_UNVERIFIED_PROVIDERS = original_override
+                radar.configured_get_bytes = original_get_bytes
+
+        self.assertEqual(results[0].id, "override_fixture")
+        self.assertEqual(results[0].status, "ok")
+        self.assertEqual(results[0].metadata["unverified_override_active"], True)
+        self.assertEqual(len(results[0].frames), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
