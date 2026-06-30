@@ -15,15 +15,16 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageSequence
 
 
 OUTPUT_DIR = "public/data"
 RADAR_DIR = os.path.join(OUTPUT_DIR, "radar")
+RADAR_VECTOR_DIR = os.path.join(OUTPUT_DIR, "radar_vectors")
 LAYER_DIR = os.path.join(OUTPUT_DIR, "layers")
 
 RADAR_RAIN_RATE_ID = "radar_rain_rate"
@@ -149,6 +150,12 @@ REGION_BOUNDS = {
     "Germany": (4.5, 46.8, 15.5, 55.5),
     "Finland": (18.0, 58.0, 33.5, 71.5),
     "Japan": (122.8, 24.0, 146.1, 46.1),
+    "El Salvador": (-90.833, 12.112, -87.044, 15.244),
+    "Taiwan": (115.0, 18.0, 126.5125, 29.0125),
+    "Malaysia Peninsular": (96.92, -1.33, 106.28, 8.97),
+    "Malaysia East": (107.08, -1.48, 121.19, 9.18),
+    "Europe OPERA": (-25.0, 34.0, 45.0, 72.0),
+    "Italy DPC": (4.5, 35.0, 19.1, 47.6),
 }
 
 ECCC_GEOMET_URL = "https://geo.weather.gc.ca/geomet"
@@ -169,6 +176,16 @@ JMA_NOWCAST_TILE_TEMPLATE = (
     "https://www.jma.go.jp/bosai/jmatile/data/nowc/{base_time}/none/"
     "{valid_time}/surf/hrpns/{z}/{x}/{y}.png"
 )
+MARN_BUCKET_URL = "https://storage.googleapis.com"
+MARN_BUCKET_API_URL = "https://storage.googleapis.com/storage/v1/b/radar-images-sv/o"
+MARN_PRODUCT_PREFIX = "esar82/Images/"
+CWA_BASE_URL = "https://cwaopendata.s3.ap-northeast-1.amazonaws.com"
+CWA_ARCHIVE_PREFIX = "/history/Observation"
+MMD_RADAR_GIF_URL = "https://api.met.gov.my/static/images/radar-latest.gif"
+OPERA_BASE_URL = "https://s3.waw3-1.cloudferro.com/openradar-24h"
+DPC_API_BASE_URL = "https://radar-api.protezionecivile.it"
+NOAA_MRMS_NCEP_BASE_URL = "https://mrms.ncep.noaa.gov/2D"
+IEM_BASE_URL = "https://mesonet.agron.iastate.edu"
 
 ECCC_RAIN_RAMP = [
     (0.1, "#8cc7fe"),
@@ -221,6 +238,45 @@ JMA_HRPNS_COLOR_VALUES = {
     "#ff9900": 40.0,
     "#ff2800": 65.0,
     "#b40068": 90.0,
+}
+MMD_DBZ_PALETTE = (
+    (210, 10, 210, 65.0),
+    (255, 55, 255, 64.6),
+    (255, 115, 255, 62.7),
+    (180, 0, 0, 59.8),
+    (220, 0, 0, 55.0),
+    (255, 38, 0, 53.5),
+    (247, 119, 0, 50.2),
+    (247, 165, 0, 43.8),
+    (255, 209, 0, 39.0),
+    (255, 255, 0, 37.5),
+    (0, 240, 0, 34.2),
+    (0, 200, 0, 27.8),
+    (0, 172, 0, 23.0),
+    (0, 135, 0, 21.5),
+    (52, 206, 236, 18.2),
+    (5, 155, 255, 11.8),
+    (0, 113, 226, 7.0),
+    (255, 255, 255, 2.2),
+)
+MMD_MAX_RGB_DIST2 = int(os.getenv("MMD_MAX_RGB_DIST2", "64") or "64")
+MMD_SUBRECTS = {
+    "MYPENINSULAR": (11, 562, 0, 424),
+    "MYEAST": (0, 570, 460, 1100),
+}
+MRMS_REFLECTIVITY_PRODUCTS = {
+    "USCOMP": ("MergedReflectivityQCComposite", (-129.995, 20.005, -60.005, 54.995)),
+    "AKCOMP": ("ALASKA/MergedReflectivityQCComposite", (-175.995, 50.005, -126.005, 71.995)),
+    "HICOMP": ("HAWAII/MergedReflectivityQCComposite", (-163.998, 15.002, -151.002, 25.997)),
+    "PRCOMP": ("CARIB/MergedReflectivityQCComposite", (-89.995, 10.005, -60.005, 24.995)),
+    "GUCOMP": ("GUAM/MergedReflectivityQCComposite", (140.002, 9.002, 149.998, 17.997)),
+}
+IEM_REGIONS = {
+    "USCOMP": ("USCOMP", (-126.0, 23.0, -65.0, 50.0)),
+    "AKCOMP": ("AKCOMP", (-170.5, 53.2, -130.5, 68.7)),
+    "HICOMP": ("HICOMP", (-162.4, 15.4, -152.4, 24.4)),
+    "PRCOMP": ("PRCOMP", (-71.1, 13.1, -61.1, 23.1)),
+    "GUCOMP": ("GUCOMP", (140.5, 9.2, 149.0, 17.7)),
 }
 
 
@@ -283,6 +339,8 @@ def ensure_clean_output() -> None:
         os.makedirs(os.path.join(OUTPUT_DIR, layer_id), exist_ok=True)
     shutil.rmtree(RADAR_DIR, ignore_errors=True)
     os.makedirs(RADAR_DIR, exist_ok=True)
+    shutil.rmtree(RADAR_VECTOR_DIR, ignore_errors=True)
+    os.makedirs(RADAR_VECTOR_DIR, exist_ok=True)
     os.makedirs(LAYER_DIR, exist_ok=True)
 
 
@@ -466,6 +524,98 @@ def rgba_to_color_ramp_values(
 def rgba_to_configured_values(image: Image.Image, color_values: Dict[str, Any]) -> np.ndarray:
     ramp = [(float(value), color) for color, value in color_values.items()]
     return rgba_to_color_ramp_values(image, ramp, max_color_distance=int(os.getenv("RADAR_CONFIG_COLOR_DISTANCE", "900")))
+
+
+def dbz_to_mm_h(dbz: np.ndarray) -> np.ndarray:
+    values = np.asarray(dbz, dtype=np.float32)
+    z = np.power(10.0, values / 10.0)
+    rain = np.power(z / 200.0, 1.0 / 1.6)
+    return np.where(np.isfinite(rain) & (values > -32.0), np.clip(rain, 0.0, 250.0), 0.0).astype(np.float32)
+
+
+def decode_marn_png(image_bytes: bytes) -> np.ndarray:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    r = rgba[..., 0].astype(np.int32)
+    g = rgba[..., 1].astype(np.int32)
+    b = rgba[..., 2].astype(np.int32)
+    alpha = rgba[..., 3]
+    hue = np.full(rgba.shape[:2], np.nan, dtype=np.float32)
+    arc1 = (g == 255) & (r == 0)
+    hue[arc1] = 120.0 + b[arc1].astype(np.float32) * (60.0 / 255.0)
+    arc2 = (b == 255) & (r == 0) & (g != 255)
+    hue[arc2] = 240.0 - g[arc2].astype(np.float32) * (60.0 / 255.0)
+    arc3 = (b == 255) & (g == 0) & (r != 0)
+    hue[arc3] = 240.0 + r[arc3].astype(np.float32) * (60.0 / 255.0)
+    dbz = 10.0 + (hue - 120.0) * (60.0 / 180.0)
+    return dbz_to_mm_h(np.where((alpha == 0) | np.isnan(hue), -33.0, dbz))
+
+
+def parse_cwa_xml(image_bytes: bytes, width: int = 921, height: int = 881) -> np.ndarray:
+    root = ET.fromstring(image_bytes)
+    content = None
+    for element in root.iter():
+        if element.tag.endswith("content"):
+            content = element.text
+            break
+    if not content:
+        raise ValueError("CWA XML missing content element")
+    flat = np.fromstring(content, sep=",", dtype=np.float32)
+    expected = width * height
+    if flat.size != expected:
+        raise ValueError(f"CWA grid size mismatch: {flat.size}, expected {expected}")
+    dbz = flat.reshape(height, width)[::-1]
+    dbz = np.where(dbz <= -99.0, -33.0, dbz)
+    return dbz_to_mm_h(dbz)
+
+
+def decode_mmd_rgb(rgb: np.ndarray) -> np.ndarray:
+    palette_rgb = np.array([(r, g, b) for r, g, b, _ in MMD_DBZ_PALETTE], dtype=np.int32)
+    palette_dbz = np.array([dbz for *_, dbz in MMD_DBZ_PALETTE], dtype=np.float32)
+    flat = np.asarray(rgb, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+    distances = np.sum((flat[:, None, :] - palette_rgb[None, :, :]) ** 2, axis=2)
+    closest = np.argmin(distances, axis=1)
+    closest_distance = distances[np.arange(flat.shape[0]), closest]
+    dbz = np.full(flat.shape[0], -33.0, dtype=np.float32)
+    valid = closest_distance <= MMD_MAX_RGB_DIST2
+    dbz[valid] = palette_dbz[closest[valid]]
+    return dbz_to_mm_h(dbz.reshape(rgb.shape[:2]))
+
+
+def decode_iem_n0q_png(image_bytes: bytes) -> np.ndarray:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        if image.mode == "P":
+            raw = np.asarray(image, dtype=np.uint8)
+        else:
+            raw = np.asarray(image.convert("L"), dtype=np.uint8)
+    dbz = raw.astype(np.float32) / 2.0 - 32.0
+    return dbz_to_mm_h(np.where(raw == 0, -33.0, dbz))
+
+
+def fill_thin_gaps(values: np.ndarray) -> np.ndarray:
+    mask = values > 0
+    padded = np.pad(mask, 1, mode="constant")
+    neighbor_count = sum(
+        padded[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if dy or dx
+    )
+    gap_pixels = (~mask) & (neighbor_count >= 6)
+    if not np.any(gap_pixels):
+        return values
+    padded_values = np.pad(values, 1, mode="constant")
+    neighbor_max = np.maximum.reduce(
+        [
+            padded_values[1 + dy : 1 + dy + values.shape[0], 1 + dx : 1 + dx + values.shape[1]]
+            for dy in (-1, 0, 1)
+            for dx in (-1, 0, 1)
+            if dy or dx
+        ]
+    )
+    output = values.copy()
+    output[gap_pixels] = neighbor_max[gap_pixels]
+    return output.astype(np.float32)
 
 
 def tile_axis(start: float, end: float, step: float, descending: bool = False) -> np.ndarray:
@@ -699,7 +849,7 @@ def selected_frames_for_offset(frames: List[PrecipFrame], offset_minutes: int) -
         if current:
             weight = persistence_weight(offset_minutes)
             if weight > 0:
-                selected.append((current[0], weight))
+                selected.extend((frame, weight) for frame in current)
     return selected
 
 
@@ -739,6 +889,21 @@ def split_precip_by_wet_bulb(precip_rate: np.ndarray, wet_bulb_c: np.ndarray) ->
     snow = np.where(snow_mask, precip_rate, 0.0).astype(np.float32)
     mixed = np.where(mixed_mask, precip_rate, 0.0).astype(np.float32)
     return rain, snow, mixed
+
+
+def split_precip_by_model_phase(
+    precip_rate: np.ndarray,
+    model_rain: np.ndarray,
+    model_snow: np.ndarray,
+    model_mixed: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    precip = np.where(np.isfinite(precip_rate), precip_rate, 0.0).astype(np.float32)
+    model_total = np.maximum(model_rain, 0.0) + np.maximum(model_snow, 0.0) + np.maximum(model_mixed, 0.0)
+    has_phase = model_total > 0.0
+    rain = np.where(has_phase, precip * np.maximum(model_rain, 0.0) / np.maximum(model_total, 1e-6), precip)
+    snow = np.where(has_phase, precip * np.maximum(model_snow, 0.0) / np.maximum(model_total, 1e-6), 0.0)
+    mixed = np.where(has_phase, precip * np.maximum(model_mixed, 0.0) / np.maximum(model_total, 1e-6), 0.0)
+    return rain.astype(np.float32), snow.astype(np.float32), mixed.astype(np.float32)
 
 
 def create_frame(
@@ -993,7 +1158,7 @@ def fetch_noaa_mrms(client: requests.Session) -> ProviderResult:
         attribution="NOAA MRMS / AWS Open Data",
         source_url=NOAA_MRMS_DOCS_URL,
         source_kind="grib2-s3-open-data",
-        metadata={"object_key": key},
+        metadata={"object_key": key, "phase_from_model": True},
     )
     return ProviderResult(
         id="noaa_mrms",
@@ -1003,6 +1168,125 @@ def fetch_noaa_mrms(client: requests.Session) -> ProviderResult:
         attribution="NOAA MRMS / AWS Open Data",
         frames=[frame],
         metadata={"anonymous": True},
+    )
+
+
+def mrms_reflectivity_latest_url(product_path: str) -> str:
+    product_name = product_path.split("/")[-1]
+    return f"{NOAA_MRMS_NCEP_BASE_URL}/{product_path}/MRMS_{product_name}.latest.grib2.gz"
+
+
+def parse_mrms_reflectivity_grib(grib_gz_bytes: bytes) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[str]]:
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise RuntimeError("NOAA MRMS reflectivity decoding requires xarray and cfgrib") from exc
+
+    grib_bytes = gzip.decompress(grib_gz_bytes)
+    with tempfile.NamedTemporaryFile(suffix=".grib2") as handle:
+        handle.write(grib_bytes)
+        handle.flush()
+        dataset = xr.open_dataset(handle.name, engine="cfgrib", backend_kwargs={"indexpath": ""})
+        data = next(iter(dataset.data_vars.values()))
+        dbz = data.values.astype(np.float32)
+        latitudes = dataset["latitude"].values.astype(np.float64)
+        longitudes = dataset["longitude"].values.astype(np.float64)
+        valid_time = dataset.coords.get("valid_time")
+        ref_time = None
+        if valid_time is not None:
+            ref_time = np.datetime_as_string(valid_time.values, unit="s") + "+00:00"
+
+    values = dbz_to_mm_h(np.where(dbz < -900.0, -33.0, dbz))
+    values, latitudes, longitudes = normalize_lonlat_arrays(values, latitudes, longitudes)
+    return values, latitudes, longitudes, ref_time
+
+
+def fetch_noaa_mrms_reflectivity_regions(client: requests.Session) -> ProviderResult:
+    provider_id = "noaa_mrms_reflectivity"
+    frames: List[PrecipFrame] = []
+    errors = []
+    for region_id, (product_path, _bounds) in MRMS_REFLECTIVITY_PRODUCTS.items():
+        url = mrms_reflectivity_latest_url(product_path)
+        try:
+            grib_gz_bytes, http_time = get_bytes(client, url)
+            values, latitudes, longitudes, ref_time = parse_mrms_reflectivity_grib(grib_gz_bytes)
+            frames.append(
+                create_frame(
+                    provider_id=f"{provider_id}_{region_id.lower()}",
+                    name=f"NOAA MRMS {region_id} Reflectivity",
+                    valid_time=ref_time or http_time,
+                    lead_minutes=0,
+                    latitudes=latitudes,
+                    longitudes=longitudes,
+                    rain=values,
+                    snow=None,
+                    mixed=None,
+                    attribution="NOAA MRMS / NCEP",
+                    source_url=NOAA_MRMS_DOCS_URL,
+                    source_kind="grib2-radar-dbz",
+                    metadata={
+                        "region": region_id,
+                        "product_path": product_path,
+                        "requested_url": url,
+                        "phase_from_model": True,
+                        "native_parameter": "reflectivity_dbz",
+                    },
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{region_id}: {exc}")
+    if not frames:
+        raise ValueError("No usable NOAA MRMS reflectivity regions found. " + " | ".join(errors))
+    return ProviderResult(
+        id=provider_id,
+        name="NOAA MRMS Regional Reflectivity",
+        status="ok" if not errors else "partial",
+        source_url=NOAA_MRMS_DOCS_URL,
+        attribution="NOAA MRMS / NCEP",
+        frames=frames,
+        metadata={"anonymous": True, "phase_from_model": True, "warnings": errors},
+    )
+
+
+def fetch_iem_n0q(client: requests.Session) -> ProviderResult:
+    provider_id = "iem_n0q"
+    frames: List[PrecipFrame] = []
+    errors = []
+    for region_id, (live_dir, bounds) in IEM_REGIONS.items():
+        url = f"{IEM_BASE_URL}/data/gis/images/4326/{live_dir}/n0q_0.png"
+        try:
+            image_bytes, ref_time = get_bytes(client, url)
+            values = decode_iem_n0q_png(image_bytes)
+            frames.append(
+                create_model_phase_radar_frame(
+                    f"{provider_id}_{region_id.lower()}",
+                    f"IEM NEXRAD {region_id} Composite",
+                    ref_time,
+                    bounds,
+                    values,
+                    "Iowa Environmental Mesonet / NOAA NEXRAD",
+                    IEM_BASE_URL,
+                    "palette-indexed-png-radar-dbz",
+                    {
+                        "region": region_id,
+                        "requested_url": url,
+                        "phase_from_model": True,
+                        "native_parameter": "reflectivity_dbz",
+                    },
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{region_id}: {exc}")
+    if not frames:
+        raise ValueError("No usable IEM N0Q radar regions found. " + " | ".join(errors))
+    return ProviderResult(
+        id=provider_id,
+        name="IEM NEXRAD Regional Composites",
+        status="ok" if not errors else "partial",
+        source_url=IEM_BASE_URL,
+        attribution="Iowa Environmental Mesonet / NOAA NEXRAD",
+        frames=frames,
+        metadata={"anonymous": True, "phase_from_model": True, "warnings": errors},
     )
 
 
@@ -1303,6 +1587,7 @@ def fetch_fmi_open_data(client: requests.Session) -> ProviderResult:
         source_kind="wms-radar-rain-rate",
         metadata={
             "requested_url": url,
+            "phase_from_model": True,
             "license": "CC BY 4.0",
             "license_url": FMI_LICENSE_URL,
             "wms_layer": FMI_RAIN_RATE_LAYER,
@@ -1322,6 +1607,309 @@ def fetch_fmi_open_data(client: requests.Session) -> ProviderResult:
             "wms_layer": FMI_RAIN_RATE_LAYER,
         },
     )
+
+
+def region_axes_from_bounds_and_shape(bounds: Tuple[float, float, float, float], shape: Tuple[int, int]) -> Tuple[float, float, float, float]:
+    west, south, east, north = bounds
+    rows, cols = shape
+    x_pixel_size = (east - west) / max(cols - 1, 1)
+    y_pixel_size = (south - north) / max(rows - 1, 1)
+    return x_pixel_size, y_pixel_size, west, north
+
+
+def create_model_phase_radar_frame(
+    provider_id: str,
+    name: str,
+    valid_time: Optional[str],
+    bounds: Tuple[float, float, float, float],
+    values: np.ndarray,
+    attribution: str,
+    source_url: str,
+    source_kind: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> PrecipFrame:
+    x_pixel_size, y_pixel_size, west, north = region_axes_from_bounds_and_shape(bounds, values.shape)
+    sampled, latitudes, longitudes = sample_grid(values, x_pixel_size, y_pixel_size, west, north)
+    frame_metadata = {"phase_from_model": True}
+    frame_metadata.update(metadata or {})
+    return create_frame(
+        provider_id=provider_id,
+        name=name,
+        valid_time=valid_time,
+        lead_minutes=0,
+        latitudes=latitudes,
+        longitudes=longitudes,
+        rain=sampled,
+        snow=None,
+        mixed=None,
+        attribution=attribution,
+        source_url=source_url,
+        source_kind=source_kind,
+        metadata=frame_metadata,
+    )
+
+
+def latest_marn_entry(client: requests.Session) -> Tuple[dt.datetime, str]:
+    now = dt.datetime.now(dt.timezone.utc)
+    local_now = now - dt.timedelta(hours=6)
+    entries: List[Tuple[dt.datetime, str]] = []
+    for days_back in range(0, 2):
+        date_text = (local_now - dt.timedelta(days=days_back)).strftime("%Y-%m-%d")
+        prefix = f"{MARN_PRODUCT_PREFIX}{date_text}"
+        text, _ = get_text(client, f"{MARN_BUCKET_API_URL}?{urlencode({'prefix': prefix, 'maxResults': '500'})}")
+        payload = json.loads(text)
+        for item in payload.get("items", []):
+            name = item.get("name", "")
+            stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            try:
+                local = dt.datetime.strptime(stem, "%Y-%m-%d %H-%M-%S")
+            except ValueError:
+                continue
+            parsed = local.replace(tzinfo=dt.timezone.utc) + dt.timedelta(hours=6)
+            if parsed.year >= 2000:
+                entries.append((parsed, name))
+    if not entries:
+        raise ValueError("No MARN radar images found")
+    return sorted(entries, key=lambda item: item[0])[-1]
+
+
+def fetch_marn_el_salvador(client: requests.Session) -> ProviderResult:
+    provider_id = "marn_el_salvador"
+    valid_dt, object_name = latest_marn_entry(client)
+    url = f"{MARN_BUCKET_URL}/radar-images-sv/{quote(object_name)}"
+    image_bytes, ref_time = get_bytes(client, url)
+    values = decode_marn_png(image_bytes)
+    frame = create_model_phase_radar_frame(
+        provider_id,
+        "MARN/SNET El Salvador Radar",
+        valid_dt.isoformat() if valid_dt else ref_time,
+        REGION_BOUNDS["El Salvador"],
+        values,
+        "MARN El Salvador / SNET",
+        "https://storage.googleapis.com/radar-images-sv",
+        "gcs-radar-png-dbz",
+        {"object_name": object_name},
+    )
+    return ProviderResult(
+        id=provider_id,
+        name="MARN/SNET El Salvador Radar",
+        status="ok",
+        source_url="https://storage.googleapis.com/radar-images-sv",
+        attribution="MARN El Salvador / SNET",
+        frames=[frame],
+        metadata={"anonymous": True, "phase_from_model": True},
+    )
+
+
+def cwa_url_for_timestamp(timestamp: dt.datetime) -> str:
+    rounded_minute = (timestamp.minute // 10) * 10
+    rounded = timestamp.replace(minute=rounded_minute, second=0, microsecond=0)
+    local = rounded.astimezone(dt.timezone.utc) + dt.timedelta(hours=8)
+    filename = local.strftime("%Y%m%d%H%M") + "compref_mosaic.xml"
+    return f"{CWA_BASE_URL}{CWA_ARCHIVE_PREFIX}/{filename}"
+
+
+def fetch_cwa_taiwan(client: requests.Session) -> ProviderResult:
+    provider_id = "cwa_taiwan"
+    now = dt.datetime.now(dt.timezone.utc)
+    errors = []
+    for step in range(0, 5):
+        target = now - dt.timedelta(minutes=10 * step)
+        url = cwa_url_for_timestamp(target)
+        try:
+            xml_bytes, ref_time = get_bytes(client, url)
+            values = parse_cwa_xml(xml_bytes)
+            frame = create_model_phase_radar_frame(
+                provider_id,
+                "CWA Taiwan QPESUMS Radar",
+                ref_time,
+                REGION_BOUNDS["Taiwan"],
+                values,
+                "Taiwan Central Weather Administration / Open Data",
+                "https://opendata.cwa.gov.tw/",
+                "s3-radar-xml-dbz",
+                {"requested_url": url},
+            )
+            return ProviderResult(
+                id=provider_id,
+                name="CWA Taiwan QPESUMS Radar",
+                status="ok",
+                source_url="https://opendata.cwa.gov.tw/",
+                attribution="Taiwan Central Weather Administration / Open Data",
+                frames=[frame],
+                metadata={"anonymous": True, "phase_from_model": True},
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+    raise ValueError("No usable CWA Taiwan radar XML found: " + " | ".join(errors[-2:]))
+
+
+def fetch_met_malaysia(client: requests.Session) -> ProviderResult:
+    provider_id = "met_malaysia"
+    image_bytes, ref_time = get_bytes(client, MMD_RADAR_GIF_URL)
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        frames = [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in ImageSequence.Iterator(image)]
+    if not frames:
+        raise ValueError("MET Malaysia GIF contained no frames")
+    latest = frames[-1]
+    region_specs = [
+        ("MYPENINSULAR", "Malaysia Peninsular"),
+        ("MYEAST", "Malaysia East"),
+    ]
+    precip_frames: List[PrecipFrame] = []
+    for region_name, bounds_key in region_specs:
+        y0, y1, x0, x1 = MMD_SUBRECTS[region_name]
+        values = fill_thin_gaps(decode_mmd_rgb(latest[y0:y1, x0:x1, :]))
+        precip_frames.append(
+            create_model_phase_radar_frame(
+                f"{provider_id}_{region_name.lower()}",
+                "MET Malaysia Radar Composite",
+                ref_time,
+                REGION_BOUNDS[bounds_key],
+                values,
+                "MET Malaysia / api.met.gov.my",
+                "https://api.met.gov.my/",
+                "animated-gif-radar-dbz",
+                {"region": region_name, "phase_from_model": True},
+            )
+        )
+    return ProviderResult(
+        id=provider_id,
+        name="MET Malaysia Radar Composite",
+        status="ok",
+        source_url="https://api.met.gov.my/",
+        attribution="MET Malaysia / api.met.gov.my",
+        frames=precip_frames,
+        metadata={"anonymous": True, "phase_from_model": True, "frames_in_gif": len(frames)},
+    )
+
+
+def opera_url_for_timestamp(timestamp: dt.datetime) -> str:
+    rounded_minute = (timestamp.minute // 5) * 5
+    rounded = timestamp.replace(minute=rounded_minute, second=0, microsecond=0)
+    filename = rounded.strftime("OPERA@%Y%m%dT%H%M@0@DBZH.h5")
+    path = rounded.strftime(f"%Y/%m/%d/OPERA/COMP/{filename}")
+    return f"{OPERA_BASE_URL}/{path}"
+
+
+def parse_opera_hdf5(payload: bytes) -> np.ndarray:
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("OPERA HDF5 decoding requires h5py") from exc
+    with h5py.File(io.BytesIO(payload), "r") as handle:
+        raw = handle["dataset1/data1/data"][:]
+        what = handle["dataset1/data1/what"]
+        nodata = float(what.attrs["nodata"])
+        undetect = float(what.attrs["undetect"])
+        gain = float(what.attrs["gain"])
+        offset = float(what.attrs["offset"])
+    dbz = raw.astype(np.float32) * gain + offset
+    invalid = np.isclose(raw, nodata, atol=1.0) | np.isclose(raw, undetect, atol=1.0)
+    return dbz_to_mm_h(np.where(invalid, -33.0, dbz))
+
+
+def fetch_opera_europe(client: requests.Session) -> ProviderResult:
+    provider_id = "opera_europe"
+    now = dt.datetime.now(dt.timezone.utc)
+    errors = []
+    for step in range(0, 5):
+        target = now - dt.timedelta(minutes=5 * step)
+        url = opera_url_for_timestamp(target)
+        try:
+            payload, ref_time = get_bytes(client, url)
+            values = parse_opera_hdf5(payload)
+            frame = create_model_phase_radar_frame(
+                provider_id,
+                "EUMETNET OPERA Europe Radar",
+                ref_time,
+                REGION_BOUNDS["Europe OPERA"],
+                values,
+                "EUMETNET OPERA",
+                "https://www.eumetnet.eu/activities/observations-programme/current-activities/opera/",
+                "hdf5-radar-dbz",
+                {"requested_url": url, "phase_from_model": True},
+            )
+            return ProviderResult(
+                id=provider_id,
+                name="EUMETNET OPERA Europe Radar",
+                status="ok",
+                source_url="https://www.eumetnet.eu/activities/observations-programme/current-activities/opera/",
+                attribution="EUMETNET OPERA",
+                frames=[frame],
+                metadata={"anonymous": True, "phase_from_model": True},
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+    raise ValueError("No usable OPERA Europe HDF5 found: " + " | ".join(errors[-2:]))
+
+
+def latest_dpc_timestamp_ms(client: requests.Session) -> int:
+    response = client.get(f"{DPC_API_BASE_URL}/findLastProductByType?type=VMI", timeout=TIMEOUT)
+    response.raise_for_status()
+    products = response.json().get("lastProducts") or []
+    if not products:
+        raise ValueError("DPC findLastProductByType returned no products")
+    return int(products[0]["time"])
+
+
+def dpc_download_url(client: requests.Session, timestamp_ms: int) -> str:
+    response = client.post(
+        f"{DPC_API_BASE_URL}/downloadProduct",
+        json={"productType": "VMI", "productDate": timestamp_ms},
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if "url" not in payload:
+        raise ValueError("DPC downloadProduct did not return a URL")
+    return payload["url"]
+
+
+def parse_dpc_tiff(payload: bytes) -> np.ndarray:
+    try:
+        import tifffile
+    except ImportError as exc:
+        raise RuntimeError("DPC GeoTIFF decoding requires tifffile") from exc
+    values = tifffile.imread(io.BytesIO(payload)).astype(np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"DPC GeoTIFF has unexpected shape: {values.shape}")
+    return dbz_to_mm_h(np.where(values < -100.0, -33.0, values))
+
+
+def fetch_dpc_italy(client: requests.Session) -> ProviderResult:
+    provider_id = "dpc_italy"
+    latest_ms = latest_dpc_timestamp_ms(client)
+    errors = []
+    for step in range(0, 4):
+        timestamp_ms = latest_ms - step * 5 * 60 * 1000
+        try:
+            url = dpc_download_url(client, timestamp_ms)
+            payload, ref_time = get_bytes(client, url)
+            values = parse_dpc_tiff(payload)
+            frame = create_model_phase_radar_frame(
+                provider_id,
+                "Radar-DPC Italy VMI Radar",
+                dt.datetime.fromtimestamp(timestamp_ms / 1000.0, tz=dt.timezone.utc).isoformat(),
+                REGION_BOUNDS["Italy DPC"],
+                values,
+                "Radar-DPC / Dipartimento della Protezione Civile",
+                "https://radar-api.protezionecivile.it",
+                "geotiff-radar-dbz",
+                {"requested_url": url, "http_ref_time": ref_time, "phase_from_model": True},
+            )
+            return ProviderResult(
+                id=provider_id,
+                name="Radar-DPC Italy VMI Radar",
+                status="ok",
+                source_url="https://radar-api.protezionecivile.it",
+                attribution="Radar-DPC / Dipartimento della Protezione Civile",
+                frames=[frame],
+                metadata={"anonymous": True, "phase_from_model": True, "license": "CC-BY-SA 4.0"},
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+    raise ValueError("No usable DPC Italy GeoTIFF found: " + " | ".join(errors[-2:]))
 
 
 def lon_to_tile_x(lon: float, zoom: int) -> int:
@@ -1406,7 +1994,7 @@ def fetch_jma_nowcast(client: requests.Session) -> ProviderResult:
                 attribution="Japan Meteorological Agency",
                 source_url="https://www.jma.go.jp/jp/radnowc/index.html",
                 source_kind="xyz-raster-tiles",
-                metadata={"base_time": base_time, "valid_time": valid_time},
+                metadata={"base_time": base_time, "valid_time": valid_time, "phase_from_model": True},
             )
         )
     return ProviderResult(
@@ -1665,10 +2253,17 @@ def fetch_all_providers(client: requests.Session) -> List[ProviderResult]:
     providers = [
         ("eccc_geomet", "ECCC GeoMet North American Radar", ECCC_RADAR_DOCS_URL, "Environment and Climate Change Canada / MSC GeoMet", fetch_eccc_geomet),
         ("noaa_mrms", "NOAA MRMS Precipitation Rate", NOAA_MRMS_DOCS_URL, "NOAA MRMS / AWS Open Data", fetch_noaa_mrms),
+        ("noaa_mrms_reflectivity", "NOAA MRMS Regional Reflectivity", NOAA_MRMS_DOCS_URL, "NOAA MRMS / NCEP", fetch_noaa_mrms_reflectivity_regions),
+        ("iem_n0q", "IEM NEXRAD Regional Composites", IEM_BASE_URL, "Iowa Environmental Mesonet / NOAA NEXRAD", fetch_iem_n0q),
         ("noaa_gfs", "NOAA GFS Short-Range Precipitation Fallback", "https://nomads.ncep.noaa.gov/", "NOAA GFS / NOMADS", fetch_noaa_gfs_provider),
         ("dwd_open_data", "DWD Open Data Radar Composite", DWD_SOURCE_URL, "Deutscher Wetterdienst / DWD Open Data", fetch_dwd_open_data),
         ("fmi_open_data", "FMI Open Data Finland Radar", FMI_OPEN_DATA_URL, "Finnish Meteorological Institute / FMI Open Data", fetch_fmi_open_data),
         ("jma_nowcast", "JMA Nowcast Radar", "https://www.jma.go.jp/jp/radnowc/index.html", "Japan Meteorological Agency", fetch_jma_nowcast),
+        ("marn_el_salvador", "MARN/SNET El Salvador Radar", "https://storage.googleapis.com/radar-images-sv", "MARN El Salvador / SNET", fetch_marn_el_salvador),
+        ("cwa_taiwan", "CWA Taiwan QPESUMS Radar", "https://opendata.cwa.gov.tw/", "Taiwan Central Weather Administration / Open Data", fetch_cwa_taiwan),
+        ("met_malaysia", "MET Malaysia Radar Composite", "https://api.met.gov.my/", "MET Malaysia / api.met.gov.my", fetch_met_malaysia),
+        ("opera_europe", "EUMETNET OPERA Europe Radar", "https://www.eumetnet.eu/activities/observations-programme/current-activities/opera/", "EUMETNET OPERA", fetch_opera_europe),
+        ("dpc_italy", "Radar-DPC Italy VMI Radar", "https://radar-api.protezionecivile.it", "Radar-DPC / Dipartimento della Protezione Civile", fetch_dpc_italy),
     ]
     results: List[ProviderResult] = []
     for provider_id, name, source_url, attribution, fetcher in providers:
@@ -1707,14 +2302,34 @@ def make_work_grid(
     source_urls = set()
     ref_times: List[str] = []
 
+    phase_model = None
+    exact_phase_models = [frame for frame in model_frames if frame.lead_minutes == offset_minutes and intersects_bounds(tile_bounds, frame.bounds)]
+    if exact_phase_models:
+        phase_model = exact_phase_models[0]
+    model_phase_rain = model_phase_snow = model_phase_mixed = None
+    if phase_model is not None:
+        model_phase_rain = resample_field(phase_model, "rain_mm_h", lat_vals, lon_vals)
+        model_phase_snow = resample_field(phase_model, "snow_mm_h", lat_vals, lon_vals)
+        model_phase_mixed = resample_field(phase_model, "mixed_mm_h", lat_vals, lon_vals)
+
     for frame, weight in selected:
         if frame_is_model(frame):
             continue
         if not intersects_bounds(tile_bounds, frame.bounds):
             continue
-        rain = merge_max(rain, resample_field(frame, "rain_mm_h", lat_vals, lon_vals), weight)
-        snow = merge_max(snow, resample_field(frame, "snow_mm_h", lat_vals, lon_vals), weight)
-        mixed = merge_max(mixed, resample_field(frame, "mixed_mm_h", lat_vals, lon_vals), weight)
+        frame_rain = resample_field(frame, "rain_mm_h", lat_vals, lon_vals)
+        frame_snow = resample_field(frame, "snow_mm_h", lat_vals, lon_vals)
+        frame_mixed = resample_field(frame, "mixed_mm_h", lat_vals, lon_vals)
+        if frame.metadata.get("phase_from_model") and model_phase_rain is not None:
+            frame_rain, frame_snow, frame_mixed = split_precip_by_model_phase(
+                frame_rain,
+                model_phase_rain,
+                model_phase_snow,
+                model_phase_mixed,
+            )
+        rain = merge_max(rain, frame_rain, weight)
+        snow = merge_max(snow, frame_snow, weight)
+        mixed = merge_max(mixed, frame_mixed, weight)
         provider_ids.add(frame.provider_id)
         attributions.add(frame.attribution)
         source_urls.add(frame.source_url)
@@ -2084,6 +2699,35 @@ def provider_catalog() -> Dict[str, Any]:
                 "free": True,
                 "registration_required": False,
                 "source_url": NOAA_MRMS_DOCS_URL,
+                "metadata": {"phase_source": "model"},
+            },
+            {
+                "id": "noaa_mrms_reflectivity",
+                "name": "NOAA MRMS regional reflectivity",
+                "coverage": "United States, Alaska, Hawaii, Caribbean, and Guam",
+                "free": True,
+                "registration_required": False,
+                "source_url": NOAA_MRMS_DOCS_URL,
+                "metadata": {
+                    "native_kind": "GRIB2 radar reflectivity",
+                    "native_parameter": "reflectivity_dbz",
+                    "phase_source": "model",
+                    "regions": sorted(MRMS_REFLECTIVITY_PRODUCTS),
+                },
+            },
+            {
+                "id": "iem_n0q",
+                "name": "IEM NEXRAD regional radar composites",
+                "coverage": "United States, Alaska, Hawaii, Caribbean, and Guam",
+                "free": True,
+                "registration_required": False,
+                "source_url": IEM_BASE_URL,
+                "metadata": {
+                    "native_kind": "palette-indexed PNG radar reflectivity",
+                    "native_parameter": "reflectivity_dbz",
+                    "phase_source": "model",
+                    "regions": sorted(IEM_REGIONS),
+                },
             },
             {
                 "id": "noaa_gfs",
@@ -2119,6 +2763,7 @@ def provider_catalog() -> Dict[str, Any]:
                     "wms_url": FMI_WMS_URL,
                     "wms_layer": FMI_RAIN_RATE_LAYER,
                     "native_kind": "WMS radar rain-rate image",
+                    "phase_source": "model",
                 },
             },
             {
@@ -2128,6 +2773,53 @@ def provider_catalog() -> Dict[str, Any]:
                 "free": True,
                 "registration_required": False,
                 "source_url": "https://www.jma.go.jp/jp/radnowc/index.html",
+                "metadata": {"native_kind": "XYZ radar precipitation tiles", "phase_source": "model"},
+            },
+            {
+                "id": "marn_el_salvador",
+                "name": "MARN/SNET El Salvador radar",
+                "coverage": "El Salvador and nearby Central America",
+                "free": True,
+                "registration_required": False,
+                "source_url": "https://storage.googleapis.com/radar-images-sv",
+                "metadata": {"native_kind": "PNG radar reflectivity", "phase_source": "model"},
+            },
+            {
+                "id": "cwa_taiwan",
+                "name": "CWA Taiwan QPESUMS radar",
+                "coverage": "Taiwan and surrounding waters",
+                "free": True,
+                "registration_required": False,
+                "source_url": "https://opendata.cwa.gov.tw/",
+                "metadata": {"native_kind": "XML radar reflectivity grid", "phase_source": "model"},
+            },
+            {
+                "id": "met_malaysia",
+                "name": "MET Malaysia radar composite",
+                "coverage": "Peninsular Malaysia, Borneo, Brunei, Singapore, and N. Sumatra",
+                "free": True,
+                "registration_required": False,
+                "source_url": "https://api.met.gov.my/",
+                "metadata": {"native_kind": "animated GIF radar reflectivity", "phase_source": "model"},
+            },
+            {
+                "id": "opera_europe",
+                "name": "EUMETNET OPERA Europe radar",
+                "coverage": "Pan-European radar composite",
+                "free": True,
+                "registration_required": False,
+                "source_url": "https://www.eumetnet.eu/activities/observations-programme/current-activities/opera/",
+                "metadata": {"native_kind": "ODIM HDF5 radar reflectivity", "phase_source": "model"},
+            },
+            {
+                "id": "dpc_italy",
+                "name": "Radar-DPC Italy VMI radar",
+                "coverage": "Italy and neighbouring areas",
+                "free": True,
+                "registration_required": False,
+                "source_url": "https://radar-api.protezionecivile.it",
+                "license": "CC-BY-SA 4.0",
+                "metadata": {"native_kind": "GeoTIFF radar reflectivity", "phase_source": "model"},
             },
             {
                 "id": "configured_providers",

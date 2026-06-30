@@ -4,3 +4,5 @@ xarray
 cfgrib
 eccodes
 Pillow
+h5py
+tifffile

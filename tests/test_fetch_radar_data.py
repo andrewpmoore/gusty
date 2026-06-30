@@ -43,6 +43,35 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         np.testing.assert_allclose(snow, [[1.0, 0.0, 0.0]])
         np.testing.assert_allclose(mixed, [[0.0, 2.0, 0.0]])
 
+    def test_split_precip_by_model_phase(self):
+        precip = np.array([[4.0, 6.0, 8.0]], dtype=np.float32)
+        model_rain = np.array([[1.0, 0.0, 1.0]], dtype=np.float32)
+        model_snow = np.array([[0.0, 2.0, 1.0]], dtype=np.float32)
+        model_mixed = np.array([[0.0, 0.0, 2.0]], dtype=np.float32)
+
+        rain, snow, mixed = radar.split_precip_by_model_phase(
+            precip,
+            model_rain,
+            model_snow,
+            model_mixed,
+        )
+
+        np.testing.assert_allclose(rain, [[4.0, 0.0, 2.0]])
+        np.testing.assert_allclose(snow, [[0.0, 6.0, 2.0]])
+        np.testing.assert_allclose(mixed, [[0.0, 0.0, 4.0]])
+
+    def test_selected_frames_keeps_multiple_regions_for_persistence(self):
+        frames = [
+            self._model_frame(0, 1.0),
+            self._model_frame(0, 2.0),
+        ]
+        frames[0].provider_id = "multi"
+        frames[1].provider_id = "multi"
+
+        selected = radar.selected_frames_for_offset(frames, 15)
+
+        self.assertEqual(len(selected), 2)
+
     def test_polish_precip_keeps_transparent_zero_and_softens_core(self):
         values = np.zeros((7, 7), dtype=np.float32)
         values[3, 3] = 10.0
@@ -111,6 +140,55 @@ class FetchRadarDataCoreTests(unittest.TestCase):
         np.testing.assert_allclose(frame.rain_mm_h, np.full((2, 2), 4.0))
         np.testing.assert_allclose(frame.snow_mm_h, np.full((2, 2), 2.0))
         self.assertEqual(frame.metadata["interpolated_from_minutes"], [60, 120])
+
+    def test_marn_png_decodes_hue_gradient_to_precip(self):
+        image = Image.new("RGBA", (2, 1), (0, 0, 0, 0))
+        image.putpixel((0, 0), (0, 255, 0, 255))
+        image.putpixel((1, 0), (255, 0, 255, 255))
+        payload = BytesIO()
+        image.save(payload, format="PNG")
+
+        values = radar.decode_marn_png(payload.getvalue())
+
+        self.assertGreater(float(values[0, 1]), float(values[0, 0]))
+        self.assertGreater(float(values[0, 0]), 0.0)
+
+    def test_cwa_xml_parses_south_to_north_dbz_grid(self):
+        xml = b"""<root xmlns="urn:cwa:gov:tw:cwacommon:0.1"><content>10,20,-999,40</content></root>"""
+
+        values = radar.parse_cwa_xml(xml, width=2, height=2)
+
+        self.assertGreater(float(values[0, 1]), float(values[1, 1]))
+        self.assertEqual(float(values[0, 0]), 0.0)
+
+    def test_mmd_rgb_decodes_palette_to_precip(self):
+        rgb = np.array([[[255, 255, 255], [220, 0, 0]]], dtype=np.uint8)
+
+        values = radar.decode_mmd_rgb(rgb)
+
+        self.assertGreater(float(values[0, 1]), float(values[0, 0]))
+        self.assertGreater(float(values[0, 0]), 0.0)
+
+    def test_iem_n0q_decodes_palette_index_dbz(self):
+        image = Image.new("P", (2, 1))
+        image.putpixel((0, 0), 0)
+        image.putpixel((1, 0), 120)
+        payload = BytesIO()
+        image.save(payload, format="PNG")
+
+        values = radar.decode_iem_n0q_png(payload.getvalue())
+
+        self.assertEqual(float(values[0, 0]), 0.0)
+        self.assertGreater(float(values[0, 1]), 0.0)
+
+    def test_mrms_reflectivity_latest_url_uses_product_leaf_name(self):
+        url = radar.mrms_reflectivity_latest_url("ALASKA/MergedReflectivityQCComposite")
+
+        self.assertEqual(
+            url,
+            "https://mrms.ncep.noaa.gov/2D/ALASKA/MergedReflectivityQCComposite/"
+            "MRMS_MergedReflectivityQCComposite.latest.grib2.gz",
+        )
 
     def test_fmi_open_data_normalizes_wms_rain_rate(self):
         image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
