@@ -102,8 +102,24 @@ function isReferenceWithHarmonics(station) {
   );
 }
 
+function isSubordinateWithOffsets(station) {
+  return (
+    station.type === "subordinate" &&
+    typeof station.offsets?.reference === "string" &&
+    typeof station.offsets?.height?.type === "string" &&
+    typeof station.offsets?.height?.high === "number" &&
+    typeof station.offsets?.height?.low === "number" &&
+    typeof station.offsets?.time?.high === "number" &&
+    typeof station.offsets?.time?.low === "number"
+  );
+}
+
+function hasPredictableTides(station) {
+  return isReferenceWithHarmonics(station) || isSubordinateWithOffsets(station);
+}
+
 function isAllowedForCurrentMode(station, args) {
-  if (!isReferenceWithHarmonics(station)) return false;
+  if (!hasPredictableTides(station)) return false;
   if (!args.includeNonCommercial && station.license?.commercial_use !== true) {
     return false;
   }
@@ -120,6 +136,8 @@ function compactStation(station) {
     license: station.license?.type ?? null,
     licenseUrl: station.license?.url ?? null,
     commercialUse: station.license?.commercial_use === true,
+    stationType: station.type,
+    referenceStationId: station.offsets?.reference ?? null,
     country: station.country,
     region: station.region ?? null,
     continent: station.continent ?? null,
@@ -151,6 +169,71 @@ function buildEvents(station, start, end) {
     .sort((a, b) => a.time.localeCompare(b.time));
 }
 
+function applySubordinateHeightOffset(heightM, offsets, type) {
+  const value = type === "high" ? offsets.height.high : offsets.height.low;
+  if (offsets.height.type === "ratio") return heightM * value;
+  if (offsets.height.type === "fixed") return heightM + value;
+  throw new Error(
+    `Unsupported subordinate height offset type: ${offsets.height.type}`,
+  );
+}
+
+function buildSubordinateEvents(station, referenceEvents) {
+  const offsets = station.offsets;
+  return referenceEvents
+    .map((event) => {
+      const type = event.type === "high" ? "high" : "low";
+      const minutes = type === "high" ? offsets.time.high : offsets.time.low;
+      return {
+        time: new Date(new Date(event.time).getTime() + minutes * 60 * 1000)
+          .toISOString(),
+        type,
+        heightM: round(
+          applySubordinateHeightOffset(event.heightM, offsets, type),
+          3,
+        ),
+      };
+    })
+    .sort((a, b) => a.time.localeCompare(b.time));
+}
+
+function buildStationEvents(
+  station,
+  referenceStationsById,
+  referenceEventsById,
+  start,
+  end,
+) {
+  if (isReferenceWithHarmonics(station)) {
+    const events = buildEvents(station, start, end);
+    referenceEventsById.set(station.id, events);
+    return events;
+  }
+
+  if (isSubordinateWithOffsets(station)) {
+    const referenceId = station.offsets.reference;
+    let referenceEvents = referenceEventsById.get(referenceId);
+    if (!referenceEvents) {
+      const referenceStation = referenceStationsById.get(referenceId);
+      if (!referenceStation) {
+        throw new Error(
+          `Missing reference station for subordinate reference: ${referenceId}`,
+        );
+      }
+      referenceEvents = buildEvents(referenceStation, start, end);
+      referenceEventsById.set(referenceId, referenceEvents);
+    }
+    if (!referenceEvents) {
+      throw new Error(
+        `Missing reference station events for subordinate reference: ${referenceId}`,
+      );
+    }
+    return buildSubordinateEvents(station, referenceEvents);
+  }
+
+  throw new Error(`Unsupported station type: ${station.type}`);
+}
+
 async function writeJson(filePath, data) {
   await writeFile(`${filePath}.tmp`, `${JSON.stringify(data, null, 2)}\n`);
   await rm(filePath, { force: true });
@@ -165,13 +248,20 @@ async function main() {
   const validTo = addDays(validFrom, args.days);
 
   const stationSource = args.includeAllQuality ? allStations : stations;
+  const referenceStationsById = new Map(
+    stationSource.filter(isReferenceWithHarmonics).map((station) => [station.id, station]),
+  );
+
   let selected = stationSource.filter((station) =>
     isAllowedForCurrentMode(station, args),
   );
   if (args.stationIds.size > 0) {
     selected = selected.filter((station) => args.stationIds.has(station.id));
   }
-  selected.sort((a, b) => a.id.localeCompare(b.id));
+  selected.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "reference" ? -1 : 1;
+    return a.id.localeCompare(b.id);
+  });
   if (args.maxStations !== undefined) {
     selected = selected.slice(0, args.maxStations);
   }
@@ -181,11 +271,18 @@ async function main() {
 
   const stationIndex = [];
   const errors = [];
+  const referenceEventsById = new Map();
 
   for (const station of selected) {
     try {
       const compact = compactStation(station);
-      const events = buildEvents(station, validFrom, validTo);
+      const events = buildStationEvents(
+        station,
+        referenceStationsById,
+        referenceEventsById,
+        validFrom,
+        validTo,
+      );
       const fileName = eventFileName(station.id);
       stationIndex.push({
         ...compact,
@@ -204,7 +301,7 @@ async function main() {
         },
         disclaimer: NOT_FOR_NAVIGATION,
         attribution:
-          "Tide harmonic constituents from the Neaps tide database (https://github.com/openwatersio/tide-database).",
+          "Tide harmonic constituents and subordinate station offsets from the Neaps tide database (https://github.com/openwatersio/tide-database).",
         events,
       });
     } catch (error) {
@@ -231,8 +328,9 @@ async function main() {
     filters: {
       commercialUse: args.includeNonCommercial ? "included" : true,
       qualityAcceptedOnly: !args.includeAllQuality,
-      stationType: "reference",
-      requiresHarmonicConstituents: true,
+      stationType: "reference-and-subordinate",
+      requiresHarmonicConstituents: "reference stations only",
+      subordinateOffsets: true,
     },
     units: {
       height: "m above chart datum",
@@ -240,7 +338,7 @@ async function main() {
     },
     disclaimer: NOT_FOR_NAVIGATION,
     attribution:
-      "Tide harmonic constituents from the Neaps tide database (https://github.com/openwatersio/tide-database).",
+      "Tide harmonic constituents and subordinate station offsets from the Neaps tide database (https://github.com/openwatersio/tide-database).",
     errors,
   });
 
