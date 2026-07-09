@@ -64,7 +64,8 @@ jobs:
           PAGASA_ALERTS_GEOJSON_URL: ${{ vars.PAGASA_ALERTS_GEOJSON_URL }}
           FIJI_RSMC_ALERTS_GEOJSON_URL: ${{ vars.FIJI_RSMC_ALERTS_GEOJSON_URL }}
           JTWC_ALERTS_GEOJSON_URL: ${{ vars.JTWC_ALERTS_GEOJSON_URL }}
-        run: python fetch_hazard_data.py --previous-dir gusty_data_repo --print-summary
+        # The output of this script is redirected to /dev/null to prevent log bloat
+        run: python fetch_hazard_data.py --previous-dir gusty_data_repo > /dev/null 2>&1
 
       - name: Deploy Hazard Data
         env:
