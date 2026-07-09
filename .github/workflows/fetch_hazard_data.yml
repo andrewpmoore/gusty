@@ -26,6 +26,17 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -34,15 +45,15 @@ jobs:
       - name: Install Python Libraries
         run: pip install requests
 
-      - name: Download Previous Data
+      - name: Clone Data Repository
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
         run: |
-          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" previous_data || true
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" gusty_data_repo || true
 
       - name: Fetch Hazard Layers
         env:
-          GUSTY_PREVIOUS_DATA_DIR: previous_data
+          GUSTY_PREVIOUS_DATA_DIR: gusty_data_repo
           GUSTY_USER_AGENT: "GustyWeather/1.0 (https://gustyweather.com; weather-data-ingestion)"
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
           METEOALARM_FEEDS: ${{ vars.METEOALARM_FEEDS }}
@@ -53,32 +64,30 @@ jobs:
           PAGASA_ALERTS_GEOJSON_URL: ${{ vars.PAGASA_ALERTS_GEOJSON_URL }}
           FIJI_RSMC_ALERTS_GEOJSON_URL: ${{ vars.FIJI_RSMC_ALERTS_GEOJSON_URL }}
           JTWC_ALERTS_GEOJSON_URL: ${{ vars.JTWC_ALERTS_GEOJSON_URL }}
-        run: python fetch_hazard_data.py --previous-dir previous_data --print-summary
+        run: python fetch_hazard_data.py --previous-dir gusty_data_repo --print-summary
 
       - name: Deploy Hazard Data
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
         run: |
-          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" latest_data || true
-          rm -rf latest_data/.git
-          mkdir deploy_staging
-          cd deploy_staging
-          git init
-          git branch -M main
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [ -d "../latest_data" ]; then
-            cp -a ../latest_data/. .
-          else
+          cd gusty_data_repo
+          
+          if [ ! -d ".git" ]; then
+            git init
+            git branch -M main
             echo "Init" > init.txt
           fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           rm -rf hazards layers
           cp -a ../public/data/hazards ./hazards
           cp -a ../public/data/layers ./layers
+          
           git add .
           git commit --allow-empty -m "Latest Hazard Data: $(date -u)"
+          
           for attempt in 1 2 3; do
             if git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force; then
               exit 0
