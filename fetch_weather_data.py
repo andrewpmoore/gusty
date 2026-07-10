@@ -222,7 +222,7 @@ NOAA_CONFIG = {
 }
 
 OUTPUT_DIR = "public/data"
-HOURS_TO_FETCH = [6]
+HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
 TILE_SIZE = 20
 PACK_LAT_SIZE = 60
 PACK_LON_SIZE = 80
@@ -427,7 +427,7 @@ def download_idx_message(base_url, idx_match, output_path):
     print(f"⚠️ NOAA IDX field not found: {' '.join(idx_match)}")
     return False
 
-def make_components(subset, config, job_type, sample_step=1, subset_min=None, subset_max=None):
+def make_components(subset, config, job_type, sample_step=1, subset_min=None, subset_max=None, model_grids=None):
     components = []
     data_vars = list(subset.data_vars)
 
@@ -466,9 +466,30 @@ def make_components(subset, config, job_type, sample_step=1, subset_min=None, su
                 )
             ))
 
+            # Individual multi-model temperature values.  These channels are
+            # kept alongside the aggregate range so clients can show a
+            # per-model tooltip without downloading the source GRIB files.
+            model_channels = {
+                "ifs": 12,
+                "aifs": 13,
+                "aigfs": 14,
+                "icon": 15,
+            }
+            for model_name, parameter_number in model_channels.items():
+                model_grid = model_grids.get(model_name) if model_grids else None
+                if model_grid is None:
+                    continue
+                components.append((
+                    parameter_number,
+                    prepare_grid_values(
+                        model_grid.values[::sample_step, ::sample_step],
+                        precision_for_job(job_type)
+                    )
+                ))
+
     return components
 
-def build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=None, max_grid=None):
+def build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=None, max_grid=None, model_grids=None):
     if not tile_origins:
         return None
 
@@ -505,13 +526,21 @@ def build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=None, 
             longitude=slice(pack_lon_start, pack_lon_end)
         ).values
 
+    subset_model_grids = {}
+    for model_name, model_grid in (model_grids or {}).items():
+        subset_model_grids[model_name] = model_grid.sel(
+            latitude=slice(pack_lat_end, pack_lat_start),
+            longitude=slice(pack_lon_start, pack_lon_end)
+        )
+
     components = make_components(
         subset,
         config,
         job_type,
         OVERVIEW_SAMPLE_STEP,
         subset_min=subset_min,
-        subset_max=subset_max
+        subset_max=subset_max,
+        model_grids=subset_model_grids
     )
     if not components:
         return None
@@ -525,7 +554,7 @@ def normalize_dataset_coordinates(ds):
         longitude=(((ds.coords["longitude"] + 180) % 360) - 180)
     ).sortby('longitude')
 
-def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=None, max_grid=None):
+def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=None, max_grid=None, model_grids=None):
     ref_time_iso = str(ds.time.values)
     print(f"   ✂️ Tiling {job_type}...")
 
@@ -556,7 +585,23 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
                 subset_min = min_grid.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end)).values
                 subset_max = max_grid.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end)).values
 
-            components = make_components(subset, config, job_type, subset_min=subset_min, subset_max=subset_max)
+            subset_model_grids = {}
+            if job_type == "temp":
+                subset_model_grids = {
+                    model_name: model_grid.sel(
+                        latitude=slice(lat_end, lat_start),
+                        longitude=slice(lon_start, lon_end)
+                    )
+                    for model_name, model_grid in (model_grids or {}).items()
+                }
+            components = make_components(
+                subset,
+                config,
+                job_type,
+                subset_min=subset_min,
+                subset_max=subset_max,
+                model_grids=subset_model_grids
+            )
             if not components: continue
 
             tile_path = os.path.join(job_dir, filename)
@@ -575,7 +620,15 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
         )
         entries = [(key, tile_path) for key, tile_path, _, _ in pack_tiles]
         tile_origins = [(lat_start, lon_start) for _, _, lat_start, lon_start in pack_tiles]
-        overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=min_grid, max_grid=max_grid)
+        overview_tile = build_pack_overview_tile(
+            ds,
+            config,
+            job_type,
+            tile_origins,
+            min_grid=min_grid,
+            max_grid=max_grid,
+            model_grids=model_grids
+        )
         if overview_tile:
             entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
         write_tile_pack(pack_path, entries)
@@ -583,11 +636,19 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
 
     return ref_time_iso, count, pack_count
 
-def generate_tiles(grib_path, forecast_hour, job_type, config, min_grid=None, max_grid=None):
+def generate_tiles(grib_path, forecast_hour, job_type, config, min_grid=None, max_grid=None, model_grids=None):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
         ds = normalize_dataset_coordinates(ds)
-        ref_time_iso, count, pack_count = generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=min_grid, max_grid=max_grid)
+        ref_time_iso, count, pack_count = generate_tiles_from_dataset(
+            ds,
+            forecast_hour,
+            job_type,
+            config,
+            min_grid=min_grid,
+            max_grid=max_grid,
+            model_grids=model_grids
+        )
         ds.close()
         return True, ref_time_iso, count, pack_count
 
@@ -759,9 +820,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
         gfs_temp = first_data_array(gfs_ds)  # Keep in Kelvin
     except Exception as e:
         print(f"      ⚠️ GFS open error: {e}")
-        return None, None
+        return None, None, None
         
-    models_temps = [gfs_temp]
+    models_temps = {"gfs": gfs_temp}
     
     # Output paths
     ifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_ifs_{forecast_hour}.grib2")
@@ -776,7 +837,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
-            models_temps.append(temp_aligned)
+            models_temps["ifs"] = temp_aligned.load()
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing ECMWF IFS: {e}")
@@ -790,7 +851,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
-            models_temps.append(temp_aligned)
+            models_temps["aifs"] = temp_aligned.load()
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing ECMWF AIFS: {e}")
@@ -804,7 +865,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
-            models_temps.append(temp_aligned)
+            models_temps["aigfs"] = temp_aligned.load()
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing NOAA AIGFS: {e}")
@@ -818,7 +879,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
-            models_temps.append(temp_aligned)
+            models_temps["icon"] = temp_aligned.load()
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing DWD ICON-EU: {e}")
@@ -829,15 +890,17 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
     
     # Compute min/max
     if len(models_temps) > 1:
-        aligned_models = xr.align(*models_temps, join='inner')
+        model_names = list(models_temps.keys())
+        aligned_models = xr.align(*models_temps.values(), join='inner')
+        aligned_model_grids = dict(zip(model_names, aligned_models))
         combined = xr.concat(aligned_models, dim='model')
         min_grid = combined.min(dim='model')
         max_grid = combined.max(dim='model')
         print(f"      ✅ Computed variance from {len(models_temps)} models.")
-        return min_grid, max_grid
+        return min_grid, max_grid, aligned_model_grids
     else:
         print("      ⚠️ No other models downloaded. Using GFS values for min/max.")
-        return gfs_temp, gfs_temp
+        return gfs_temp, gfs_temp, {"gfs": gfs_temp}
 
 def first_data_array(ds):
     data_vars = list(ds.data_vars)
@@ -1051,11 +1114,21 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
                 for chunk in response.iter_content(chunk_size=16384):
                     f.write(chunk)
             
-            min_grid, max_grid = None, None
+            min_grid, max_grid, model_grids = None, None, None
             if job_type == "temp":
-                min_grid, max_grid = process_multi_model_variance(date, run_hour, forecast_hour, grib_path)
+                min_grid, max_grid, model_grids = process_multi_model_variance(
+                    date, run_hour, forecast_hour, grib_path
+                )
 
-            success, ref_time, count, pack_count = generate_tiles(grib_path, forecast_hour, job_type, conf, min_grid=min_grid, max_grid=max_grid)
+            success, ref_time, count, pack_count = generate_tiles(
+                grib_path,
+                forecast_hour,
+                job_type,
+                conf,
+                min_grid=min_grid,
+                max_grid=max_grid,
+                model_grids=model_grids
+            )
             if os.path.exists(grib_path): os.remove(grib_path)
             return ref_time, count, pack_count
         else:
