@@ -222,7 +222,7 @@ NOAA_CONFIG = {
 }
 
 OUTPUT_DIR = "public/data"
-HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
+HOURS_TO_FETCH = [6]
 TILE_SIZE = 20
 PACK_LAT_SIZE = 60
 PACK_LON_SIZE = 80
@@ -519,8 +519,10 @@ def build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=None, 
     return build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components)
 
 def normalize_dataset_coordinates(ds):
+    if "longitude" not in ds.coords:
+        raise ValueError("Dataset does not contain 'longitude' coordinate")
     return ds.assign_coords(
-        longitude=(((ds.longitude + 180) % 360) - 180)
+        longitude=(((ds.coords["longitude"] + 180) % 360) - 180)
     ).sortby('longitude')
 
 def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=None, max_grid=None):
@@ -635,6 +637,9 @@ def download_ecmwf_grib(model, date_str, run_hour, forecast_hour, output_path):
     base_url = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
     dt = datetime.datetime.strptime(date_str + run_hour, "%Y%m%d%H")
     
+    # Map model key to correct S3 folder name
+    s3_model = "aifs-single" if model == "aifs" else model
+    
     for i in range(5):
         try_dt = dt - datetime.timedelta(hours=6 * i)
         try_date = try_dt.strftime("%Y%m%d")
@@ -642,7 +647,7 @@ def download_ecmwf_grib(model, date_str, run_hour, forecast_hour, output_path):
         adjusted_step = forecast_hour + (6 * i)
         
         filename = f"{try_date}{try_run}0000-{adjusted_step}h-oper-fc.grib2"
-        url = f"{base_url}/{try_date}/{try_run}z/{model}/0p25/oper/{filename}"
+        url = f"{base_url}/{try_date}/{try_run}z/{s3_model}/0p25/oper/{filename}"
         
         print(f"      Trying ECMWF {model} URL: {url}")
         res = requests.get(url, stream=True, timeout=30)
@@ -674,7 +679,8 @@ def download_aigfs_grib(date_str, run_hour, forecast_hour, output_path):
         try_run = f"{try_dt.hour:02d}"
         adjusted_step = forecast_hour + (6 * i)
         
-        url = f"{base_url}/aigfs.{try_date}/{try_run}/model/atmos/grib2/aigfs.t{try_run}z.gfs.0p25.f{adjusted_step:03d}.grib2"
+        # AIGFS uses 'sfc' product identifier for surface forecasts
+        url = f"{base_url}/aigfs.{try_date}/{try_run}/model/atmos/grib2/aigfs.t{try_run}z.sfc.f{adjusted_step:03d}.grib2"
         
         print(f"      Trying NOAA AIGFS URL: {url}")
         res = requests.get(url, stream=True, timeout=30)
