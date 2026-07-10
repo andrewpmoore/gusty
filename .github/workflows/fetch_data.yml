@@ -38,7 +38,7 @@ jobs:
 
       - name: Install Python Libraries
         run: |
-          pip install requests xarray cfgrib numpy argparse
+          pip install requests xarray cfgrib numpy scipy argparse
 
       - name: Run Fetch Script
         run: |
