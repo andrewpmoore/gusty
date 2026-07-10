@@ -427,7 +427,7 @@ def download_idx_message(base_url, idx_match, output_path):
     print(f"⚠️ NOAA IDX field not found: {' '.join(idx_match)}")
     return False
 
-def make_components(subset, config, job_type, sample_step=1):
+def make_components(subset, config, job_type, sample_step=1, subset_min=None, subset_max=None):
     components = []
     data_vars = list(subset.data_vars)
 
@@ -449,9 +449,26 @@ def make_components(subset, config, job_type, sample_step=1):
             )
         ))
 
+        # Add temperature variance components (min/max)
+        if job_type == "temp" and subset_min is not None and subset_max is not None:
+            components.append((
+                10,
+                prepare_grid_values(
+                    subset_min[::sample_step, ::sample_step],
+                    precision_for_job(job_type)
+                )
+            ))
+            components.append((
+                11,
+                prepare_grid_values(
+                    subset_max[::sample_step, ::sample_step],
+                    precision_for_job(job_type)
+                )
+            ))
+
     return components
 
-def build_pack_overview_tile(ds, config, job_type, tile_origins):
+def build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=None, max_grid=None):
     if not tile_origins:
         return None
 
@@ -476,7 +493,26 @@ def build_pack_overview_tile(ds, config, job_type, tile_origins):
 
     dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
     dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
-    components = make_components(subset, config, job_type, OVERVIEW_SAMPLE_STEP)
+
+    subset_min, subset_max = None, None
+    if min_grid is not None and max_grid is not None:
+        subset_min = min_grid.sel(
+            latitude=slice(pack_lat_end, pack_lat_start),
+            longitude=slice(pack_lon_start, pack_lon_end)
+        ).values
+        subset_max = max_grid.sel(
+            latitude=slice(pack_lat_end, pack_lat_start),
+            longitude=slice(pack_lon_start, pack_lon_end)
+        ).values
+
+    components = make_components(
+        subset,
+        config,
+        job_type,
+        OVERVIEW_SAMPLE_STEP,
+        subset_min=subset_min,
+        subset_max=subset_max
+    )
     if not components:
         return None
 
@@ -487,7 +523,7 @@ def normalize_dataset_coordinates(ds):
         longitude=(((ds.longitude + 180) % 360) - 180)
     ).sortby('longitude')
 
-def generate_tiles_from_dataset(ds, forecast_hour, job_type, config):
+def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=None, max_grid=None):
     ref_time_iso = str(ds.time.values)
     print(f"   ✂️ Tiling {job_type}...")
 
@@ -513,7 +549,12 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config):
             dy = (lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1) if len(lat_vals) > 1 else 1.0
             dx = (lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1) if len(lon_vals) > 1 else 1.0
 
-            components = make_components(subset, config, job_type)
+            subset_min, subset_max = None, None
+            if min_grid is not None and max_grid is not None:
+                subset_min = min_grid.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end)).values
+                subset_max = max_grid.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end)).values
+
+            components = make_components(subset, config, job_type, subset_min=subset_min, subset_max=subset_max)
             if not components: continue
 
             tile_path = os.path.join(job_dir, filename)
@@ -532,7 +573,7 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config):
         )
         entries = [(key, tile_path) for key, tile_path, _, _ in pack_tiles]
         tile_origins = [(lat_start, lon_start) for _, _, lat_start, lon_start in pack_tiles]
-        overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins)
+        overview_tile = build_pack_overview_tile(ds, config, job_type, tile_origins, min_grid=min_grid, max_grid=max_grid)
         if overview_tile:
             entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
         write_tile_pack(pack_path, entries)
@@ -540,11 +581,11 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config):
 
     return ref_time_iso, count, pack_count
 
-def generate_tiles(grib_path, forecast_hour, job_type, config):
+def generate_tiles(grib_path, forecast_hour, job_type, config, min_grid=None, max_grid=None):
     try:
         ds = xr.open_dataset(grib_path, engine='cfgrib')
         ds = normalize_dataset_coordinates(ds)
-        ref_time_iso, count, pack_count = generate_tiles_from_dataset(ds, forecast_hour, job_type, config)
+        ref_time_iso, count, pack_count = generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=min_grid, max_grid=max_grid)
         ds.close()
         return True, ref_time_iso, count, pack_count
 
@@ -585,6 +626,212 @@ def download_grib(url, params, output_path):
         for chunk in response.iter_content(chunk_size=16384):
             f.write(chunk)
     return True
+
+def download_ecmwf_grib(model, date_str, run_hour, forecast_hour, output_path):
+    """
+    Downloads ECMWF IFS or AIFS GRIB2 file from AWS S3 public bucket.
+    Tries the matching date/run_hour first, then falls back to preceding runs.
+    """
+    base_url = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
+    dt = datetime.datetime.strptime(date_str + run_hour, "%Y%m%d%H")
+    
+    for i in range(5):
+        try_dt = dt - datetime.timedelta(hours=6 * i)
+        try_date = try_dt.strftime("%Y%m%d")
+        try_run = f"{try_dt.hour:02d}"
+        adjusted_step = forecast_hour + (6 * i)
+        
+        filename = f"{try_date}{try_run}0000-{adjusted_step}h-oper-fc.grib2"
+        url = f"{base_url}/{try_date}/{try_run}z/{model}/0p25/oper/{filename}"
+        
+        print(f"      Trying ECMWF {model} URL: {url}")
+        res = requests.get(url, stream=True, timeout=30)
+        if res.status_code == 200:
+            with open(output_path, "wb") as f:
+                for chunk in res.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            print(f"      ✅ Successfully downloaded ECMWF {model} from run {try_date} {try_run}z (step +{adjusted_step}h)")
+            return True
+        elif res.status_code == 404:
+            continue
+        else:
+            print(f"      ⚠️ ECMWF HTTP status {res.status_code} for {url}")
+            
+    print(f"      ❌ Failed to download ECMWF {model} for GFS run {date_str} {run_hour}z, step +{forecast_hour}h")
+    return False
+
+def download_aigfs_grib(date_str, run_hour, forecast_hour, output_path):
+    """
+    Downloads NOAA AIGFS GRIB2 file from NOMADS.
+    Tries the matching date/run_hour first, then falls back to preceding runs.
+    """
+    base_url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod"
+    dt = datetime.datetime.strptime(date_str + run_hour, "%Y%m%d%H")
+    
+    for i in range(5):
+        try_dt = dt - datetime.timedelta(hours=6 * i)
+        try_date = try_dt.strftime("%Y%m%d")
+        try_run = f"{try_dt.hour:02d}"
+        adjusted_step = forecast_hour + (6 * i)
+        
+        url = f"{base_url}/aigfs.{try_date}/{try_run}/model/atmos/grib2/aigfs.t{try_run}z.gfs.0p25.f{adjusted_step:03d}.grib2"
+        
+        print(f"      Trying NOAA AIGFS URL: {url}")
+        res = requests.get(url, stream=True, timeout=30)
+        if res.status_code == 200:
+            with open(output_path, "wb") as f:
+                for chunk in res.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            print(f"      ✅ Successfully downloaded NOAA AIGFS from run {try_date} {try_run}z (step +{adjusted_step}h)")
+            return True
+        elif res.status_code == 404:
+            continue
+        else:
+            print(f"      ⚠️ NOAA AIGFS HTTP status {res.status_code}")
+            
+    print(f"      ❌ Failed to download NOAA AIGFS for GFS run {date_str} {run_hour}z, step +{forecast_hour}h")
+    return False
+
+def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
+    """
+    Downloads DWD ICON-EU regular lat-lon 2m temperature GRIB2.bz2 and decompresses it.
+    Tries the matching date/run_hour first, then falls back to preceding runs.
+    """
+    base_url = "https://opendata.dwd.de/weather/nwp/icon-eu/grib"
+    bz2_path = output_path + ".bz2"
+    dt = datetime.datetime.strptime(date_str + run_hour, "%Y%m%d%H")
+    
+    for i in range(5):
+        try_dt = dt - datetime.timedelta(hours=6 * i)
+        try_date_str = try_dt.strftime("%Y%m%d%H")
+        try_run = f"{try_dt.hour:02d}"
+        adjusted_step = forecast_hour + (6 * i)
+        
+        url = f"{base_url}/{try_run}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{try_date_str}_{adjusted_step:03d}_T_2M.grib2.bz2"
+        
+        print(f"      Trying DWD ICON-EU URL: {url}")
+        res = requests.get(url, stream=True, timeout=30)
+        if res.status_code == 200:
+            with open(bz2_path, "wb") as f:
+                for chunk in res.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            
+            # Decompress bz2
+            import bz2
+            try:
+                with bz2.open(bz2_path, "rb") as source, open(output_path, "wb") as dest:
+                    dest.write(source.read())
+                if os.path.exists(bz2_path):
+                    os.remove(bz2_path)
+                print(f"      ✅ Successfully downloaded and decompressed DWD ICON-EU from run {try_date_str}z (step +{adjusted_step}h)")
+                return True
+            except Exception as decompress_err:
+                print(f"      ⚠️ Decompress error for DWD ICON-EU: {decompress_err}")
+                if os.path.exists(bz2_path):
+                    os.remove(bz2_path)
+                continue
+        elif res.status_code == 404:
+            continue
+        else:
+            print(f"      ⚠️ DWD ICON-EU HTTP status {res.status_code}")
+            
+    print(f"      ❌ Failed to download DWD ICON-EU for GFS run {date_str} {run_hour}z, step +{forecast_hour}h")
+    return False
+
+def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_path):
+    """
+    Downloads other models (ECMWF IFS, ECMWF AIFS, NOAA AIGFS, DWD ICON-EU)
+    for the given date/run/step, opens them, aligns/regrids them to the GFS grid,
+    and returns min/max temperature DataArrays.
+    """
+    print(f"   🔍 Computing temperature variance from other models...")
+    
+    # Open GFS reference
+    try:
+        gfs_ds = xr.open_dataset(gfs_grib_path, engine='cfgrib')
+        gfs_ds = normalize_dataset_coordinates(gfs_ds)
+        gfs_temp = first_data_array(gfs_ds)  # Keep in Kelvin
+    except Exception as e:
+        print(f"      ⚠️ GFS open error: {e}")
+        return None, None
+        
+    models_temps = [gfs_temp]
+    
+    # Output paths
+    ifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_ifs_{forecast_hour}.grib2")
+    aifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_aifs_{forecast_hour}.grib2")
+    aigfs_path = os.path.join(OUTPUT_DIR, f"temp_variance_aigfs_{forecast_hour}.grib2")
+    icon_path = os.path.join(OUTPUT_DIR, f"temp_variance_icon_{forecast_hour}.grib2")
+    
+    # ECMWF IFS (use filter_by_keys to avoid height conflicts)
+    if download_ecmwf_grib("ifs", date_str, run_hour, forecast_hour, ifs_path):
+        try:
+            ds = xr.open_dataset(ifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
+            ds = normalize_dataset_coordinates(ds)
+            temp = first_data_array(ds)  # Keep in Kelvin
+            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            models_temps.append(temp_aligned)
+            ds.close()
+        except Exception as e:
+            print(f"      ⚠️ Error processing ECMWF IFS: {e}")
+        finally:
+            if os.path.exists(ifs_path): os.remove(ifs_path)
+            
+    # ECMWF AIFS (use filter_by_keys to avoid height conflicts)
+    if download_ecmwf_grib("aifs", date_str, run_hour, forecast_hour, aifs_path):
+        try:
+            ds = xr.open_dataset(aifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
+            ds = normalize_dataset_coordinates(ds)
+            temp = first_data_array(ds)  # Keep in Kelvin
+            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            models_temps.append(temp_aligned)
+            ds.close()
+        except Exception as e:
+            print(f"      ⚠️ Error processing ECMWF AIFS: {e}")
+        finally:
+            if os.path.exists(aifs_path): os.remove(aifs_path)
+            
+    # NOAA AIGFS (use filter_by_keys just in case)
+    if download_aigfs_grib(date_str, run_hour, forecast_hour, aigfs_path):
+        try:
+            ds = xr.open_dataset(aigfs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
+            ds = normalize_dataset_coordinates(ds)
+            temp = first_data_array(ds)  # Keep in Kelvin
+            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            models_temps.append(temp_aligned)
+            ds.close()
+        except Exception as e:
+            print(f"      ⚠️ Error processing NOAA AIGFS: {e}")
+        finally:
+            if os.path.exists(aigfs_path): os.remove(aigfs_path)
+            
+    # DWD ICON-EU (regular lat-lon)
+    if download_icon_grib(date_str, run_hour, forecast_hour, icon_path):
+        try:
+            ds = xr.open_dataset(icon_path, engine='cfgrib')
+            ds = normalize_dataset_coordinates(ds)
+            temp = first_data_array(ds)  # Keep in Kelvin
+            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            models_temps.append(temp_aligned)
+            ds.close()
+        except Exception as e:
+            print(f"      ⚠️ Error processing DWD ICON-EU: {e}")
+        finally:
+            if os.path.exists(icon_path): os.remove(icon_path)
+
+    gfs_ds.close()
+    
+    # Compute min/max
+    if len(models_temps) > 1:
+        aligned_models = xr.align(*models_temps, join='inner')
+        combined = xr.concat(aligned_models, dim='model')
+        min_grid = combined.min(dim='model')
+        max_grid = combined.max(dim='model')
+        print(f"      ✅ Computed variance from {len(models_temps)} models.")
+        return min_grid, max_grid
+    else:
+        print("      ⚠️ No other models downloaded. Using GFS values for min/max.")
+        return gfs_temp, gfs_temp
 
 def first_data_array(ds):
     data_vars = list(ds.data_vars)
@@ -793,12 +1040,16 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
             return ref_time, count, pack_count
 
         response = requests.get(url, params=params, stream=True, timeout=180)
-        
         if response.status_code == 200:
             with open(grib_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=16384):
                     f.write(chunk)
-            success, ref_time, count, pack_count = generate_tiles(grib_path, forecast_hour, job_type, conf)
+            
+            min_grid, max_grid = None, None
+            if job_type == "temp":
+                min_grid, max_grid = process_multi_model_variance(date, run_hour, forecast_hour, grib_path)
+
+            success, ref_time, count, pack_count = generate_tiles(grib_path, forecast_hour, job_type, conf, min_grid=min_grid, max_grid=max_grid)
             if os.path.exists(grib_path): os.remove(grib_path)
             return ref_time, count, pack_count
         else:
