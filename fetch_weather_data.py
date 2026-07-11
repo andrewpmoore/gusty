@@ -699,7 +699,7 @@ def derive_condition_grid(
     dew = _aligned_field(dewpoint, target)
     if temp is not None and dew is not None and cloud is not None:
         condition = xr.where(
-            ((temp - dew).abs() <= 1.0) & (cloud >= 0.75),
+            (np.abs(temp - dew) <= 1.0) & (cloud >= 0.75),
             CONDITION_CODES["Foggy"],
             condition,
         )
