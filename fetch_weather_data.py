@@ -629,9 +629,12 @@ def _first_variable(datasets, names):
     for ds in datasets:
         for name in names:
             if name in ds.data_vars:
-                value = ds[name].squeeze(drop=True)
-                if "latitude" in value.dims and "longitude" in value.dims:
-                    return value
+                try:
+                    value = ds[name].squeeze(drop=True)
+                    if "latitude" in value.dims and "longitude" in value.dims:
+                        return value
+                except Exception as error:
+                    print(f"      ⚠️ Could not read GRIB field {name}: {error}")
     return None
 
 def _aligned_field(field, target):
@@ -801,13 +804,20 @@ def extract_provider_fields(model_name, grib_path, target, temperature):
         }
         fields = {"temperature": temperature.load()}
         for name, value in raw.items():
-            aligned = _aligned_field(value, target)
-            if aligned is not None:
-                if name in {"precipitation", "snowfall"}:
-                    aligned = _interval_accumulation(
-                        model_name, name, aligned, value.attrs
-                    )
-                fields[name] = aligned
+            if value is None:
+                continue
+            try:
+                aligned = _aligned_field(value, target)
+                if aligned is not None:
+                    if name in {"precipitation", "snowfall"}:
+                        aligned = _interval_accumulation(
+                            model_name, name, aligned, value.attrs
+                        )
+                    fields[name] = aligned
+            except Exception as error:
+                print(
+                    f"      ⚠️ {model_name} {name} extraction failed: {error}"
+                )
 
         if "cloud_cover" in fields:
             cloud = fields["cloud_cover"]
@@ -829,17 +839,20 @@ def extract_provider_fields(model_name, grib_path, target, temperature):
                 np.exp((17.625 * temp_c) / (243.04 + temp_c))
             ).clip(0, 1)
 
-        fields["condition_code"] = derive_condition_grid(
-            target,
-            cloud_cover=fields.get("cloud_cover"),
-            precipitation=fields.get("precipitation"),
-            convective_precipitation=_first_variable(
-                datasets, ["cp", "rain_con", "ACPCP"]
-            ),
-            snowfall=fields.get("snowfall"),
-            temperature=temperature,
-            dewpoint=raw["dewpoint"],
-        )
+        try:
+            fields["condition_code"] = derive_condition_grid(
+                target,
+                cloud_cover=fields.get("cloud_cover"),
+                precipitation=fields.get("precipitation"),
+                convective_precipitation=_first_variable(
+                    datasets, ["cp", "rain_con", "ACPCP"]
+                ),
+                snowfall=fields.get("snowfall"),
+                temperature=temperature,
+                dewpoint=raw["dewpoint"],
+            )
+        except Exception as error:
+            print(f"      ⚠️ {model_name} condition derivation failed: {error}")
         return fields
     except Exception as error:
         print(f"      ⚠️ Provider field extraction failed for {grib_path}: {error}")
