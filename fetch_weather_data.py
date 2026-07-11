@@ -10,6 +10,7 @@ import struct
 import math
 import numpy as np
 import xarray as xr
+import cfgrib
 
 # --- CONFIGURATION REGISTRY ---
 NOAA_CONFIG = {
@@ -27,8 +28,25 @@ NOAA_CONFIG = {
     },
     "temp": {
         "type": "gfs_atmos",
-        "vars": {"var_TMP": "on"},
-        "level": {"lev_2_m_above_ground": "on"},
+        "vars": {
+            "var_TMP": "on",
+            "var_DPT": "on",
+            "var_RH": "on",
+            "var_UGRD": "on",
+            "var_VGRD": "on",
+            "var_GUST": "on",
+            "var_PRMSL": "on",
+            "var_TCDC": "on",
+            "var_VIS": "on",
+            "var_APCP": "on",
+        },
+        "level": {
+            "lev_2_m_above_ground": "on",
+            "lev_10_m_above_ground": "on",
+            "lev_surface": "on",
+            "lev_mean_sea_level": "on",
+            "lev_entire_atmosphere": "on",
+        },
         "grid_type": "scalar"
     },
     "humidity": {
@@ -223,6 +241,14 @@ NOAA_CONFIG = {
 
 OUTPUT_DIR = "public/data"
 HOURS_TO_FETCH = [0, 3, 6, 9, 12, 15, 18, 21, 24, 36, 48, 72]
+# Temperature comparisons need enough samples to derive each model's daily
+# high and low at the user's location. Keep three-hour resolution through the
+# ICON-EU horizon, then use the native six-hour cadence of the global AI
+# models through 14 days.
+TEMPERATURE_HOURS_TO_FETCH = [
+    *range(0, 121, 3),
+    *range(126, 337, 6),
+]
 TILE_SIZE = 20
 PACK_LAT_SIZE = 60
 PACK_LON_SIZE = 80
@@ -257,6 +283,51 @@ PACK_MAGIC = b"GPAK"
 PACK_VERSION = 1
 OVERVIEW_KEY_SUFFIX = "_60"
 OVERVIEW_SAMPLE_STEP = 4
+
+# Stable IDs shared with Gusty's condition-code vocabulary. Two four-bit IDs
+# are packed into each categorical tile channel.
+CONDITION_CODES = {
+    "Unknown": 0,
+    "Clear": 1,
+    "MostlyClear": 2,
+    "PartlyCloudy": 3,
+    "MostlyCloudy": 4,
+    "Cloudy": 5,
+    "Drizzle": 6,
+    "Rain": 7,
+    "HeavyRain": 8,
+    "Snow": 9,
+    "HeavySnow": 10,
+    "Sleet": 11,
+    "FreezingRain": 12,
+    "Thunderstorms": 13,
+    "Foggy": 14,
+    "Hail": 15,
+}
+
+CONDITION_CHANNEL_PAIRS = {
+    30: ("ifs", "aifs"),
+    31: ("aigfs", "icon"),
+}
+
+MODEL_FIELD_CHANNELS = {
+    "temperature": 0,
+    "dewpoint": 1,
+    "wind_u": 2,
+    "wind_v": 3,
+    "wind_gust": 4,
+    "pressure": 5,
+    "humidity": 6,
+    "cloud_cover": 7,
+    "precipitation": 8,
+    "snowfall": 9,
+    "visibility": 10,
+    "condition_code": 11,
+}
+
+MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
+MODEL_WORK_DIR = os.path.join(OUTPUT_DIR, ".model_provider_work")
+MODEL_PREVIOUS_ACCUMULATIONS = {}
 
 def clean_output_directory():
     """Wipes the output directory."""
@@ -554,6 +625,342 @@ def normalize_dataset_coordinates(ds):
         longitude=(((ds.coords["longitude"] + 180) % 360) - 180)
     ).sortby('longitude')
 
+def _first_variable(datasets, names):
+    for ds in datasets:
+        for name in names:
+            if name in ds.data_vars:
+                value = ds[name].squeeze(drop=True)
+                if "latitude" in value.dims and "longitude" in value.dims:
+                    return value
+    return None
+
+def _aligned_field(field, target):
+    if field is None:
+        return None
+    dataset = normalize_dataset_coordinates(field.to_dataset(name="value"))
+    return dataset["value"].interp_like(target, method="nearest").load()
+
+def _precipitation_mm(field):
+    if field is None:
+        return None
+    units = str(field.attrs.get("units", "")).lower()
+    # ECMWF accumulated precipitation is metres of water; NOAA commonly uses
+    # kg m-2, which is numerically equivalent to millimetres.
+    return field * 1000.0 if units in {"m", "metre", "meter"} else field
+
+def _interval_accumulation(model_name, field_name, field, source_attrs):
+    start_step = source_attrs.get("GRIB_startStep")
+    end_step = source_attrs.get("GRIB_endStep")
+    if start_step == 0 and end_step not in (None, 0):
+        key = (model_name, field_name)
+        previous = MODEL_PREVIOUS_ACCUMULATIONS.get(key)
+        MODEL_PREVIOUS_ACCUMULATIONS[key] = field
+        if previous is not None:
+            return (field - previous).clip(min=0)
+    return field
+
+def derive_condition_grid(
+    target,
+    cloud_cover=None,
+    precipitation=None,
+    convective_precipitation=None,
+    snowfall=None,
+    temperature=None,
+    dewpoint=None,
+):
+    """Derive conservative Gusty condition IDs from common model fields."""
+    condition = xr.full_like(target, CONDITION_CODES["Unknown"], dtype=np.float32)
+
+    cloud = _aligned_field(cloud_cover, target)
+    if cloud is not None:
+        cloud = xr.where(cloud > 1.5, cloud / 100.0, cloud).clip(0, 1)
+        condition = xr.where(cloud < 0.12, CONDITION_CODES["Clear"], condition)
+        condition = xr.where(
+            (cloud >= 0.12) & (cloud < 0.32),
+            CONDITION_CODES["MostlyClear"],
+            condition,
+        )
+        condition = xr.where(
+            (cloud >= 0.32) & (cloud < 0.68),
+            CONDITION_CODES["PartlyCloudy"],
+            condition,
+        )
+        condition = xr.where(
+            (cloud >= 0.68) & (cloud < 0.88),
+            CONDITION_CODES["MostlyCloudy"],
+            condition,
+        )
+        condition = xr.where(cloud >= 0.88, CONDITION_CODES["Cloudy"], condition)
+
+    temp = _aligned_field(temperature, target)
+    dew = _aligned_field(dewpoint, target)
+    if temp is not None and dew is not None and cloud is not None:
+        condition = xr.where(
+            ((temp - dew).abs() <= 1.0) & (cloud >= 0.75),
+            CONDITION_CODES["Foggy"],
+            condition,
+        )
+
+    precip = _precipitation_mm(_aligned_field(precipitation, target))
+    convective = _precipitation_mm(
+        _aligned_field(convective_precipitation, target)
+    )
+    snow = _precipitation_mm(_aligned_field(snowfall, target))
+
+    if precip is not None:
+        condition = xr.where(
+            (precip > 0.01) & (precip < 0.25),
+            CONDITION_CODES["Drizzle"],
+            condition,
+        )
+        condition = xr.where(
+            (precip >= 0.25) & (precip < 8.0),
+            CONDITION_CODES["Rain"],
+            condition,
+        )
+        condition = xr.where(
+            precip >= 8.0, CONDITION_CODES["HeavyRain"], condition
+        )
+
+    if snow is not None:
+        rain_amount = precip - snow if precip is not None else None
+        condition = xr.where(
+            snow >= 0.05, CONDITION_CODES["Snow"], condition
+        )
+        condition = xr.where(
+            snow >= 5.0, CONDITION_CODES["HeavySnow"], condition
+        )
+        if rain_amount is not None:
+            condition = xr.where(
+                (snow >= 0.05) & (rain_amount >= 0.05),
+                CONDITION_CODES["Sleet"],
+                condition,
+            )
+
+    if precip is not None and temp is not None:
+        liquid_only = True if snow is None else snow < 0.05
+        condition = xr.where(
+            (precip >= 0.05) & (temp <= 273.65) &
+            liquid_only,
+            CONDITION_CODES["FreezingRain"],
+            condition,
+        )
+
+    if convective is not None:
+        condition = xr.where(
+            convective >= 0.5, CONDITION_CODES["Thunderstorms"], condition
+        )
+
+    return condition.astype(np.float32)
+
+def extract_condition_grid(grib_path, target):
+    """Read condition inputs from a model file already downloaded for temp."""
+    datasets = []
+    try:
+        datasets = cfgrib.open_datasets(grib_path, backend_kwargs={"indexpath": ""})
+        cloud = _first_variable(datasets, ["tcc", "clct", "TCDC"])
+        precip = _first_variable(datasets, ["tp", "tot_prec", "APCP"])
+        convective = _first_variable(datasets, ["cp", "rain_con", "ACPCP"])
+        snow = _first_variable(datasets, ["sf", "snow_gsp", "ASNOW"])
+        temperature = _first_variable(datasets, ["t2m", "2t", "t"])
+        dewpoint = _first_variable(datasets, ["d2m", "2d"])
+        if all(value is None for value in [cloud, precip, snow]):
+            return None
+        return derive_condition_grid(
+            target,
+            cloud_cover=cloud,
+            precipitation=precip,
+            convective_precipitation=convective,
+            snowfall=snow,
+            temperature=temperature,
+            dewpoint=dewpoint,
+        )
+    except Exception as error:
+        print(f"      ⚠️ Condition extraction failed for {grib_path}: {error}")
+        return None
+    finally:
+        for ds in datasets:
+            ds.close()
+
+def extract_provider_fields(model_name, grib_path, target, temperature):
+    """Extract normalized provider fields while the source GRIB is local."""
+    datasets = []
+    try:
+        datasets = cfgrib.open_datasets(grib_path, backend_kwargs={"indexpath": ""})
+        raw = {
+            "dewpoint": _first_variable(datasets, ["d2m", "2d"]),
+            "wind_u": _first_variable(datasets, ["u10", "10u", "u"]),
+            "wind_v": _first_variable(datasets, ["v10", "10v", "v"]),
+            "wind_gust": _first_variable(datasets, ["fg10", "gust", "GUST"]),
+            "pressure": _first_variable(datasets, ["msl", "prmsl", "PRMSL"]),
+            "humidity": _first_variable(datasets, ["r2", "rh2m", "RH"]),
+            "cloud_cover": _first_variable(datasets, ["tcc", "clct", "TCDC"]),
+            "precipitation": _first_variable(datasets, ["tp", "tot_prec", "APCP"]),
+            "snowfall": _first_variable(datasets, ["sf", "snow_gsp", "ASNOW"]),
+            "visibility": _first_variable(datasets, ["vis", "visibility", "VIS"]),
+        }
+        fields = {"temperature": temperature.load()}
+        for name, value in raw.items():
+            aligned = _aligned_field(value, target)
+            if aligned is not None:
+                if name in {"precipitation", "snowfall"}:
+                    aligned = _interval_accumulation(
+                        model_name, name, aligned, value.attrs
+                    )
+                fields[name] = aligned
+
+        if "cloud_cover" in fields:
+            cloud = fields["cloud_cover"]
+            fields["cloud_cover"] = xr.where(cloud > 1.5, cloud / 100.0, cloud).clip(0, 1)
+        for name in ("precipitation", "snowfall"):
+            if name in fields:
+                fields[name] = _precipitation_mm(fields[name])
+                fields[name].attrs["units"] = "mm"
+        if "humidity" in fields:
+            humidity = fields["humidity"]
+            fields["humidity"] = xr.where(
+                humidity > 1.5, humidity / 100.0, humidity
+            ).clip(0, 1)
+        elif "dewpoint" in fields:
+            temp_c = fields["temperature"] - 273.15
+            dew_c = fields["dewpoint"] - 273.15
+            fields["humidity"] = (
+                np.exp((17.625 * dew_c) / (243.04 + dew_c)) /
+                np.exp((17.625 * temp_c) / (243.04 + temp_c))
+            ).clip(0, 1)
+
+        fields["condition_code"] = derive_condition_grid(
+            target,
+            cloud_cover=fields.get("cloud_cover"),
+            precipitation=fields.get("precipitation"),
+            convective_precipitation=_first_variable(
+                datasets, ["cp", "rain_con", "ACPCP"]
+            ),
+            snowfall=fields.get("snowfall"),
+            temperature=temperature,
+            dewpoint=raw["dewpoint"],
+        )
+        return fields
+    except Exception as error:
+        print(f"      ⚠️ Provider field extraction failed for {grib_path}: {error}")
+        return {"temperature": temperature.load()}
+    finally:
+        for ds in datasets:
+            ds.close()
+
+def write_model_provider_hour(model_name, forecast_hour, fields):
+    """Write temporary per-hour tiles; these are compacted into daily packs."""
+    if not fields:
+        return
+    reference = next(iter(fields.values()))
+    model_dir = os.path.join(MODEL_WORK_DIR, model_name)
+    os.makedirs(model_dir, exist_ok=True)
+    for lat_start in range(-90, 90, TILE_SIZE):
+        for lon_start in range(-180, 180, TILE_SIZE):
+            lat_end = min(lat_start + TILE_SIZE, 90)
+            lon_end = min(lon_start + TILE_SIZE, 180)
+            subset = reference.sel(
+                latitude=slice(lat_end, lat_start),
+                longitude=slice(lon_start, lon_end),
+            )
+            if subset.latitude.size == 0 or subset.longitude.size == 0:
+                continue
+            lat_vals = subset.latitude.values
+            lon_vals = subset.longitude.values
+            dy = ((lat_vals[-1] - lat_vals[0]) / (len(lat_vals) - 1)
+                  if len(lat_vals) > 1 else 1.0)
+            dx = ((lon_vals[-1] - lon_vals[0]) / (len(lon_vals) - 1)
+                  if len(lon_vals) > 1 else 1.0)
+            components = []
+            for field_name, channel in MODEL_FIELD_CHANNELS.items():
+                field = fields.get(field_name)
+                if field is None:
+                    continue
+                values = field.sel(
+                    latitude=slice(lat_end, lat_start),
+                    longitude=slice(lon_start, lon_end),
+                ).values
+                components.append((
+                    channel,
+                    prepare_grid_values(values, 3 if field_name in {
+                        "humidity", "precipitation", "snowfall"
+                    } else 1),
+                ))
+            if not components:
+                continue
+            path = os.path.join(
+                model_dir,
+                f"{forecast_hour}h_{tile_key(lat_start, lon_start)}.gtile",
+            )
+            write_binary_tile(path, lon_vals, lat_vals, dx, dy, components)
+
+def compact_model_provider_tiles(reference_time):
+    """Pack one location tile's forecast day into one CDN-friendly file."""
+    output_root = os.path.join(OUTPUT_DIR, "models")
+    os.makedirs(output_root, exist_ok=True)
+    manifest = {
+        "version": 1,
+        "ref_time": reference_time,
+        "condition_codes": CONDITION_CODES,
+        "field_channels": MODEL_FIELD_CHANNELS,
+        "models": {},
+    }
+    for model_name in MODEL_PROVIDER_IDS:
+        source_dir = os.path.join(MODEL_WORK_DIR, model_name)
+        if not os.path.isdir(source_dir):
+            continue
+        model_dir = os.path.join(output_root, model_name)
+        os.makedirs(model_dir, exist_ok=True)
+        grouped = {}
+        available_channels = set()
+        for filename in os.listdir(source_dir):
+            hour_text, tile_filename_part = filename.split("h_", 1)
+            forecast_hour = int(hour_text)
+            tile = tile_filename_part.removesuffix(".gtile")
+            day = forecast_hour // 24
+            grouped.setdefault((day, tile), []).append(
+                (forecast_hour, os.path.join(source_dir, filename))
+            )
+            with open(os.path.join(source_dir, filename), "rb") as tile_file:
+                tile_header = tile_file.read(28)
+                channel_count = tile_header[6]
+                channel_metadata = tile_file.read(channel_count * 10)
+                for index in range(channel_count):
+                    available_channels.add(
+                        struct.unpack_from("<h", channel_metadata, index * 10)[0]
+                    )
+        available_hours = set()
+        for (day, tile), entries in grouped.items():
+            entries.sort(key=lambda item: item[0])
+            available_hours.update(hour for hour, _ in entries)
+            write_tile_pack(
+                os.path.join(model_dir, f"day{day}_{tile}.gpack"),
+                [(str(hour), path) for hour, path in entries],
+            )
+        manifest["models"][model_name] = {
+            "forecast_hours": sorted(available_hours),
+            "day_count": max((hour // 24 for hour in available_hours), default=-1) + 1,
+            "fields": [
+                field_name for field_name, channel in MODEL_FIELD_CHANNELS.items()
+                if channel in available_channels
+            ],
+        }
+    with open(os.path.join(output_root, "manifest.json"), "w") as file:
+        json.dump(manifest, file, indent=2)
+    if os.path.isdir(MODEL_WORK_DIR):
+        shutil.rmtree(MODEL_WORK_DIR)
+
+def pack_condition_pair(first, second):
+    if first is None and second is None:
+        return None
+    template = first if first is not None else second
+    first_values = xr.zeros_like(template) if first is None else first
+    second_values = xr.zeros_like(template) if second is None else second
+    first_values, second_values = xr.align(first_values, second_values, join="inner")
+    return (
+        first_values.round().astype(np.int16) & 0x0F
+    ) | ((second_values.round().astype(np.int16) & 0x0F) << 4)
+
 def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=None, max_grid=None, model_grids=None):
     ref_time_iso = str(ds.time.values)
     print(f"   ✂️ Tiling {job_type}...")
@@ -638,7 +1045,17 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
 
 def generate_tiles(grib_path, forecast_hour, job_type, config, min_grid=None, max_grid=None, model_grids=None):
     try:
-        ds = xr.open_dataset(grib_path, engine='cfgrib')
+        if job_type == "temp":
+            source_datasets = cfgrib.open_datasets(
+                grib_path, backend_kwargs={"indexpath": ""}
+            )
+            temperature = _first_variable(source_datasets, ["t2m", "2t"])
+            if temperature is None:
+                raise ValueError("2 metre temperature field not found")
+            ds = temperature.to_dataset(name="temperature")
+        else:
+            source_datasets = []
+            ds = xr.open_dataset(grib_path, engine='cfgrib')
         ds = normalize_dataset_coordinates(ds)
         ref_time_iso, count, pack_count = generate_tiles_from_dataset(
             ds,
@@ -650,6 +1067,8 @@ def generate_tiles(grib_path, forecast_hour, job_type, config, min_grid=None, ma
             model_grids=model_grids
         )
         ds.close()
+        for source_ds in source_datasets:
+            source_ds.close()
         return True, ref_time_iso, count, pack_count
 
     except Exception as e:
@@ -759,11 +1178,15 @@ def download_aigfs_grib(date_str, run_hour, forecast_hour, output_path):
     print(f"      ❌ Failed to download NOAA AIGFS for GFS run {date_str} {run_hour}z, step +{forecast_hour}h")
     return False
 
-def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
-    """
-    Downloads DWD ICON-EU regular lat-lon 2m temperature GRIB2.bz2 and decompresses it.
-    Tries the matching date/run_hour first, then falls back to preceding runs.
-    """
+def download_icon_parameter(
+    date_str,
+    run_hour,
+    forecast_hour,
+    parameter,
+    file_parameter,
+    output_path,
+):
+    """Download one compact ICON-EU regular-lat-lon parameter."""
     base_url = "https://opendata.dwd.de/weather/nwp/icon-eu/grib"
     bz2_path = output_path + ".bz2"
     dt = datetime.datetime.strptime(date_str + run_hour, "%Y%m%d%H")
@@ -774,7 +1197,7 @@ def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
         try_run = f"{try_dt.hour:02d}"
         adjusted_step = forecast_hour + (6 * i)
         
-        url = f"{base_url}/{try_run}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{try_date_str}_{adjusted_step:03d}_T_2M.grib2.bz2"
+        url = f"{base_url}/{try_run}/{parameter}/icon-eu_europe_regular-lat-lon_single-level_{try_date_str}_{adjusted_step:03d}_{file_parameter}.grib2.bz2"
         
         print(f"      Trying DWD ICON-EU URL: {url}")
         res = requests.get(url, stream=True, timeout=30)
@@ -790,7 +1213,7 @@ def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
                     dest.write(source.read())
                 if os.path.exists(bz2_path):
                     os.remove(bz2_path)
-                print(f"      ✅ Successfully downloaded and decompressed DWD ICON-EU from run {try_date_str}z (step +{adjusted_step}h)")
+                print(f"      ✅ Downloaded ICON-EU {parameter} from {try_date_str}z (+{adjusted_step}h)")
                 return True
             except Exception as decompress_err:
                 print(f"      ⚠️ Decompress error for DWD ICON-EU: {decompress_err}")
@@ -802,8 +1225,46 @@ def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
         else:
             print(f"      ⚠️ DWD ICON-EU HTTP status {res.status_code}")
             
-    print(f"      ❌ Failed to download DWD ICON-EU for GFS run {date_str} {run_hour}z, step +{forecast_hour}h")
+    print(f"      ❌ Failed ICON-EU {parameter} for {date_str} {run_hour}z +{forecast_hour}h")
     return False
+
+def download_icon_grib(date_str, run_hour, forecast_hour, output_path):
+    return download_icon_parameter(
+        date_str,
+        run_hour,
+        forecast_hour,
+        "t_2m",
+        "T_2M",
+        output_path,
+    )
+
+def load_single_model_field(path, target):
+    datasets = []
+    try:
+        datasets = cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""})
+        field = first_data_array(datasets[0]) if datasets else None
+        return _aligned_field(field, target)
+    finally:
+        for ds in datasets:
+            ds.close()
+
+def icon_weather_code_grid(weather_code, cloud_cover, target):
+    """Map ICON's WMO present-weather number to Gusty condition IDs."""
+    if cloud_cover is None:
+        result = xr.full_like(target, CONDITION_CODES["Unknown"], dtype=np.float32)
+    else:
+        result = derive_condition_grid(target, cloud_cover=cloud_cover)
+    if weather_code is None:
+        return result
+    code = weather_code.round()
+    result = xr.where((code >= 45) & (code <= 48), CONDITION_CODES["Foggy"], result)
+    result = xr.where((code >= 51) & (code <= 57), CONDITION_CODES["Drizzle"], result)
+    result = xr.where(((code >= 61) & (code <= 65)) | ((code >= 80) & (code <= 82)), CONDITION_CODES["Rain"], result)
+    result = xr.where((code == 66) | (code == 67), CONDITION_CODES["FreezingRain"], result)
+    result = xr.where(((code >= 68) & (code <= 79)) | ((code >= 85) & (code <= 86)), CONDITION_CODES["Snow"], result)
+    result = xr.where((code >= 95) & (code <= 99), CONDITION_CODES["Thunderstorms"], result)
+    result = xr.where((code == 96) | (code == 99), CONDITION_CODES["Hail"], result)
+    return result.astype(np.float32)
 
 def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_path):
     """
@@ -815,14 +1276,23 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
     
     # Open GFS reference
     try:
-        gfs_ds = xr.open_dataset(gfs_grib_path, engine='cfgrib')
+        gfs_source_datasets = cfgrib.open_datasets(
+            gfs_grib_path, backend_kwargs={"indexpath": ""}
+        )
+        gfs_temp = _first_variable(gfs_source_datasets, ["t2m", "2t"])
+        if gfs_temp is None:
+            raise ValueError("GFS 2 metre temperature field not found")
+        gfs_ds = gfs_temp.to_dataset(name="temperature")
         gfs_ds = normalize_dataset_coordinates(gfs_ds)
         gfs_temp = first_data_array(gfs_ds)  # Keep in Kelvin
     except Exception as e:
         print(f"      ⚠️ GFS open error: {e}")
-        return None, None, None
+        return None, None, None, None
         
     models_temps = {"gfs": gfs_temp}
+    provider_fields = {
+        "gfs": extract_provider_fields("gfs", gfs_grib_path, gfs_temp, gfs_temp)
+    }
     
     # Output paths
     ifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_ifs_{forecast_hour}.grib2")
@@ -838,6 +1308,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
             models_temps["ifs"] = temp_aligned.load()
+            provider_fields["ifs"] = extract_provider_fields(
+                "ifs", ifs_path, gfs_temp, models_temps["ifs"]
+            )
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing ECMWF IFS: {e}")
@@ -852,6 +1325,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
             models_temps["aifs"] = temp_aligned.load()
+            provider_fields["aifs"] = extract_provider_fields(
+                "aifs", aifs_path, gfs_temp, models_temps["aifs"]
+            )
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing ECMWF AIFS: {e}")
@@ -866,20 +1342,76 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
             models_temps["aigfs"] = temp_aligned.load()
+            provider_fields["aigfs"] = extract_provider_fields(
+                "aigfs", aigfs_path, gfs_temp, models_temps["aigfs"]
+            )
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing NOAA AIGFS: {e}")
         finally:
             if os.path.exists(aigfs_path): os.remove(aigfs_path)
             
-    # DWD ICON-EU (regular lat-lon)
-    if download_icon_grib(date_str, run_hour, forecast_hour, icon_path):
+    # DWD ICON-EU ends at 120 hours; the global models continue to day 14.
+    if forecast_hour <= 120 and download_icon_grib(
+        date_str, run_hour, forecast_hour, icon_path
+    ):
         try:
             ds = xr.open_dataset(icon_path, engine='cfgrib')
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
             temp_aligned = temp.interp_like(gfs_temp, method='linear')
             models_temps["icon"] = temp_aligned.load()
+            provider_fields["icon"] = extract_provider_fields(
+                "icon", icon_path, gfs_temp, models_temps["icon"]
+            )
+            icon_supplements = {
+                "cloud_cover": ("clct", "CLCT"),
+                "precipitation": ("tot_prec", "TOT_PREC"),
+                "snowfall": ("snow_gsp", "SNOW_GSP"),
+                "weather_code": ("ww", "WW"),
+            }
+            loaded_supplements = {}
+            for field_name, (parameter, file_parameter) in icon_supplements.items():
+                supplement_path = os.path.join(
+                    OUTPUT_DIR,
+                    f"temp_provider_icon_{parameter}_{forecast_hour}.grib2",
+                )
+                try:
+                    if download_icon_parameter(
+                        date_str,
+                        run_hour,
+                        forecast_hour,
+                        parameter,
+                        file_parameter,
+                        supplement_path,
+                    ):
+                        loaded_supplements[field_name] = load_single_model_field(
+                            supplement_path, gfs_temp
+                        )
+                finally:
+                    if os.path.exists(supplement_path):
+                        os.remove(supplement_path)
+
+            icon_fields = provider_fields["icon"]
+            cloud = loaded_supplements.get("cloud_cover")
+            if cloud is not None:
+                icon_fields["cloud_cover"] = xr.where(
+                    cloud > 1.5, cloud / 100.0, cloud
+                ).clip(0, 1)
+            for field_name in ("precipitation", "snowfall"):
+                field = loaded_supplements.get(field_name)
+                if field is not None:
+                    field = _interval_accumulation(
+                        "icon", field_name, field, field.attrs
+                    )
+                    normalized = _precipitation_mm(field)
+                    normalized.attrs["units"] = "mm"
+                    icon_fields[field_name] = normalized
+            icon_fields["condition_code"] = icon_weather_code_grid(
+                loaded_supplements.get("weather_code"),
+                cloud,
+                gfs_temp,
+            )
             ds.close()
         except Exception as e:
             print(f"      ⚠️ Error processing DWD ICON-EU: {e}")
@@ -887,6 +1419,8 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             if os.path.exists(icon_path): os.remove(icon_path)
 
     gfs_ds.close()
+    for source_ds in gfs_source_datasets:
+        source_ds.close()
     
     # Compute min/max
     if len(models_temps) > 1:
@@ -897,10 +1431,15 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
         min_grid = combined.min(dim='model')
         max_grid = combined.max(dim='model')
         print(f"      ✅ Computed variance from {len(models_temps)} models.")
-        return min_grid, max_grid, aligned_model_grids
+        for model_name, fields in provider_fields.items():
+            write_model_provider_hour(model_name, forecast_hour, fields)
+        return min_grid, max_grid, aligned_model_grids, provider_fields
     else:
         print("      ⚠️ No other models downloaded. Using GFS values for min/max.")
-        return gfs_temp, gfs_temp, {"gfs": gfs_temp}
+        write_model_provider_hour(
+            "gfs", forecast_hour, provider_fields["gfs"]
+        )
+        return gfs_temp, gfs_temp, {"gfs": gfs_temp}, provider_fields
 
 def first_data_array(ds):
     data_vars = list(ds.data_vars)
@@ -1116,7 +1655,7 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
             
             min_grid, max_grid, model_grids = None, None, None
             if job_type == "temp":
-                min_grid, max_grid, model_grids = process_multi_model_variance(
+                min_grid, max_grid, model_grids, _ = process_multi_model_variance(
                     date, run_hour, forecast_hour, grib_path
                 )
 
@@ -1158,7 +1697,10 @@ if __name__ == "__main__":
         job_ref_time = None
         total_tiles = 0
         total_packs = 0
-        for hour in HOURS_TO_FETCH:
+        forecast_hours = (
+            TEMPERATURE_HOURS_TO_FETCH if job == "temp" else HOURS_TO_FETCH
+        )
+        for hour in forecast_hours:
             ref_time, count, pack_count = download_and_process(job, date, run, hour)
             if ref_time: job_ref_time = ref_time
             total_tiles += count
@@ -1177,6 +1719,8 @@ if __name__ == "__main__":
             if "metadata" in NOAA_CONFIG[job]:
                 manifest_entry["metadata"] = NOAA_CONFIG[job]["metadata"]
             manifest_updates[job] = manifest_entry
+            if job == "temp":
+                compact_model_provider_tiles(job_ref_time)
 
     if manifest_updates:
         print("\n✅ Batch Complete.")
