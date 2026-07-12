@@ -326,6 +326,13 @@ MODEL_FIELD_CHANNELS = {
 }
 
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
+MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon")
+MULTI_FORECAST_HIGH_CHANNELS = {
+    model: 20 + index for index, model in enumerate(MULTI_FORECAST_MODELS)
+}
+MULTI_FORECAST_LOW_CHANNELS = {
+    model: 24 + index for index, model in enumerate(MULTI_FORECAST_MODELS)
+}
 MODEL_WORK_DIR = os.path.join(OUTPUT_DIR, ".model_provider_work")
 MODEL_PREVIOUS_ACCUMULATIONS = {}
 
@@ -464,6 +471,32 @@ def write_tile_pack(pack_path, entries):
     with open(pack_path, "wb") as f:
         f.write(header)
         f.write(data)
+
+def read_binary_tile(path):
+    """Read one generated tile for server-side forecast aggregation."""
+    with open(path, "rb") as file:
+        tile = file.read()
+    if tile[:4] != MAGIC:
+        raise ValueError(f"Invalid tile header: {path}")
+    _, _, channel_count, _, width, height, lon0, lat0, dx, dy = struct.unpack_from(
+        "<BBBBHHffff", tile, 4
+    )
+    metadata_offset = 28
+    values_offset = metadata_offset + channel_count * 10
+    value_count = width * height
+    channels = {}
+    for index in range(channel_count):
+        channel, scale, offset = struct.unpack_from(
+            "<hff", tile, metadata_offset + index * 10
+        )
+        start = values_offset + index * value_count * 2
+        quantized = np.frombuffer(
+            tile, dtype="<i2", count=value_count, offset=start
+        ).astype(np.float32)
+        channels[channel] = (quantized * scale + offset).reshape(height, width)
+    lon_vals = lon0 + np.arange(width, dtype=np.float32) * dx
+    lat_vals = lat0 + np.arange(height, dtype=np.float32) * dy
+    return lon_vals, lat_vals, dx, dy, channels
 
 def download_idx_message(base_url, idx_match, output_path):
     idx_url = f"{base_url}.idx"
@@ -907,6 +940,72 @@ def write_model_provider_hour(model_name, forecast_hour, fields):
             )
             write_binary_tile(path, lon_vals, lat_vals, dx, dy, components)
 
+def compact_multi_forecast_tiles():
+    """Precompute every model's daily high/low into one request per tile."""
+    output_dir = os.path.join(OUTPUT_DIR, "models", "multi")
+    os.makedirs(output_dir, exist_ok=True)
+    model_files = {}
+    tile_names = set()
+    for model_name in MULTI_FORECAST_MODELS:
+        source_dir = os.path.join(MODEL_WORK_DIR, model_name)
+        indexed = {}
+        if os.path.isdir(source_dir):
+            for filename in os.listdir(source_dir):
+                hour_text, tile_filename = filename.split("h_", 1)
+                tile = tile_filename.removesuffix(".gtile")
+                day = int(hour_text) // 24
+                indexed.setdefault((tile, day), []).append(
+                    os.path.join(source_dir, filename)
+                )
+                tile_names.add(tile)
+        model_files[model_name] = indexed
+
+    for tile in sorted(tile_names):
+        day_entries = []
+        for day in range(15):
+            components = []
+            geometry = None
+            for model_name in MULTI_FORECAST_MODELS:
+                paths = model_files[model_name].get((tile, day), [])
+                daily_high = None
+                daily_low = None
+                for path in paths:
+                    lon_vals, lat_vals, dx, dy, channels = read_binary_tile(path)
+                    temperature = channels.get(MODEL_FIELD_CHANNELS["temperature"])
+                    if temperature is None:
+                        continue
+                    geometry = (lon_vals, lat_vals, dx, dy)
+                    daily_high = (
+                        temperature.copy() if daily_high is None
+                        else np.maximum(daily_high, temperature)
+                    )
+                    daily_low = (
+                        temperature.copy() if daily_low is None
+                        else np.minimum(daily_low, temperature)
+                    )
+                if daily_high is not None:
+                    components.append((
+                        MULTI_FORECAST_HIGH_CHANNELS[model_name],
+                        prepare_grid_values(daily_high, 1),
+                    ))
+                    components.append((
+                        MULTI_FORECAST_LOW_CHANNELS[model_name],
+                        prepare_grid_values(daily_low, 1),
+                    ))
+            if geometry is None or not components:
+                continue
+            lon_vals, lat_vals, dx, dy = geometry
+            day_entries.append((
+                str(day),
+                build_binary_tile_bytes(
+                    lon_vals, lat_vals, dx, dy, components
+                ),
+            ))
+        if day_entries:
+            write_tile_pack(
+                os.path.join(output_dir, f"{tile}.gpack"), day_entries
+            )
+
 def compact_model_provider_tiles(reference_time):
     """Pack one location tile's forecast day into one CDN-friendly file."""
     output_root = os.path.join(OUTPUT_DIR, "models")
@@ -943,16 +1042,20 @@ def compact_model_provider_tiles(reference_time):
                         struct.unpack_from("<h", channel_metadata, index * 10)[0]
                     )
         available_hours = set()
-        for (day, tile), entries in grouped.items():
-            entries.sort(key=lambda item: item[0])
+        horizon_entries = {}
+        for (_, tile), entries in grouped.items():
             available_hours.update(hour for hour, _ in entries)
+            horizon_entries.setdefault(tile, []).extend(entries)
+        for tile, entries in horizon_entries.items():
+            entries.sort(key=lambda item: item[0])
             write_tile_pack(
-                os.path.join(model_dir, f"day{day}_{tile}.gpack"),
+                os.path.join(model_dir, f"{tile}.gpack"),
                 [(str(hour), path) for hour, path in entries],
             )
         manifest["models"][model_name] = {
             "forecast_hours": sorted(available_hours),
             "day_count": max((hour // 24 for hour in available_hours), default=-1) + 1,
+            "pack_layout": "complete_horizon",
             "fields": [
                 field_name for field_name, channel in MODEL_FIELD_CHANNELS.items()
                 if channel in available_channels
@@ -960,6 +1063,7 @@ def compact_model_provider_tiles(reference_time):
         }
     with open(os.path.join(output_root, "manifest.json"), "w") as file:
         json.dump(manifest, file, indent=2)
+    compact_multi_forecast_tiles()
     if os.path.isdir(MODEL_WORK_DIR):
         shutil.rmtree(MODEL_WORK_DIR)
 
