@@ -1,0 +1,35 @@
+name: Configure Weather R2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - r2_lifecycle.json
+      - .github/workflows/configure_r2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply lifecycle policy
+        run: |
+          aws s3api put-bucket-lifecycle-configuration \
+            --bucket "$R2_BUCKET" \
+            --lifecycle-configuration file://r2_lifecycle.json \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      - name: Verify lifecycle policy
+        run: |
+          aws s3api get-bucket-lifecycle-configuration \
+            --bucket "$R2_BUCKET" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"

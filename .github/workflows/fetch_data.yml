@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'fetch_weather_data.py'
+      - 'consensus_pipeline.py'
+      - 'extract_station_forecasts.py'
       - '.github/workflows/fetch_data.yml'
   schedule:
     - cron: '30 4,10,16,22 * * *'
@@ -40,10 +42,50 @@ jobs:
         run: |
           pip install requests xarray cfgrib numpy scipy argparse
 
+      - name: Restore Consensus State from R2
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          mkdir -p .consensus_state
+          aws s3 cp \
+            "s3://${R2_BUCKET}/state/weights.json" \
+            .consensus_state/weights.json \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
       - name: Run Fetch Script
+        env:
+          CONSENSUS_WEIGHTS_FILE: .consensus_state/weights.json
         run: |
           # This script cleans public/data locally and then fills it with new JSONs
           python fetch_weather_data.py --type all
+
+      - name: Upload Current Forecasts to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          run_prefix="runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          aws s3 sync public/data "s3://${R2_BUCKET}/${run_prefix}" \
+            --endpoint-url "$endpoint" \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 sync public/data "s3://${R2_BUCKET}/current" \
+            --delete \
+            --endpoint-url "$endpoint" \
+            --cache-control "public,max-age=300,stale-while-revalidate=3600"
+          printf '{"schema":1,"run":"%s","published_at":"%s"}\n' \
+            "$run_prefix" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > current.json
+          aws s3 cp current.json "s3://${R2_BUCKET}/current.json" \
+            --endpoint-url "$endpoint" \
+            --cache-control "no-cache"
 
       - name: Deploy Data (Keep Exactly 2 Commits)
         env:

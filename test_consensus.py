@@ -30,6 +30,16 @@ class ConsensusTests(unittest.TestCase):
         result = weather._weighted_median(stack, weights)
         self.assertAlmostEqual(float(result[0, 0]), 290.0)
 
+    def test_skill_weights_are_normalized_within_model_family(self):
+        weights = weather._family_balanced_weights(
+            ["gfs", "aigfs", "ifs", "icon"],
+            {"gfs": 0.75, "aigfs": 0.25, "ifs": 0.4, "icon": 0.8},
+        )
+        self.assertAlmostEqual(float(weights[0]), 0.375)
+        self.assertAlmostEqual(float(weights[1]), 0.125)
+        self.assertAlmostEqual(float(weights[2]), 0.4)
+        self.assertAlmostEqual(float(weights[3]), 0.8)
+
     def test_condition_ties_prefer_consequential_family(self):
         stack = np.array([
             weather.CONDITION_CODES["Clear"],

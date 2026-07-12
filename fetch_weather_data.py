@@ -5,6 +5,7 @@ import datetime
 import time
 import json
 import argparse
+import concurrent.futures
 import sys
 import struct
 import math
@@ -353,6 +354,9 @@ MULTI_FORECAST_LOW_CHANNELS = {
 }
 MODEL_WORK_DIR = os.path.join(OUTPUT_DIR, ".model_provider_work")
 MODEL_PREVIOUS_ACCUMULATIONS = {}
+CONSENSUS_WEIGHTS_FILE = os.environ.get(
+    "CONSENSUS_WEIGHTS_FILE", os.path.join(OUTPUT_DIR, "models", "weights.json")
+)
 
 def clean_output_directory():
     """Wipes the output directory."""
@@ -1036,13 +1040,27 @@ def compact_multi_forecast_tiles():
                 os.path.join(output_dir, f"{tile}.gpack"), day_entries
             )
 
-def _family_balanced_weights(model_names):
+def load_consensus_skill_weights(path=CONSENSUS_WEIGHTS_FILE):
+    try:
+        with open(path) as file:
+            document = json.load(file)
+        return {
+            name: max(float(value), 0.0)
+            for name, value in document.get("weights", {}).items()
+        }
+    except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+def _family_balanced_weights(model_names, skill_weights=None):
+    """Apply learned skill without letting sibling models multiply a family."""
+    skill_weights = skill_weights or {}
     family_counts = {}
     for model_name in model_names:
         family = MODEL_FAMILIES[model_name]
         family_counts[family] = family_counts.get(family, 0) + 1
     return np.array([
-        1.0 / family_counts[MODEL_FAMILIES[model_name]]
+        max(float(skill_weights.get(model_name, 1.0)), 0.01)
+        / family_counts[MODEL_FAMILIES[model_name]]
         for model_name in model_names
     ], dtype=np.float32)
 
@@ -1124,6 +1142,7 @@ def compact_consensus_tiles():
     """Build one robust median/vote forecast from all available models."""
     output_dir = os.path.join(OUTPUT_DIR, "models", "consensus")
     os.makedirs(output_dir, exist_ok=True)
+    skill_weights = load_consensus_skill_weights()
     indexed = {}
     for model_name in MODEL_PROVIDER_IDS:
         source_dir = os.path.join(MODEL_WORK_DIR, model_name)
@@ -1165,7 +1184,7 @@ def compact_consensus_tiles():
             if family_count < 2:
                 continue
             stack = np.stack(values)
-            weights = _family_balanced_weights(model_names)
+            weights = _family_balanced_weights(model_names, skill_weights)
             if field_name == "condition_code":
                 consensus = _condition_consensus(stack, weights)
                 spread = np.max(stack, axis=0) - np.min(stack, axis=0)
@@ -1675,9 +1694,38 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
     aifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_aifs_{forecast_hour}.grib2")
     aigfs_path = os.path.join(OUTPUT_DIR, f"temp_variance_aigfs_{forecast_hour}.grib2")
     icon_path = os.path.join(OUTPUT_DIR, f"temp_variance_icon_{forecast_hour}.grib2")
+
+    download_jobs = {
+        "ifs": lambda: download_ecmwf_grib(
+            "ifs", date_str, run_hour, forecast_hour, ifs_path
+        ),
+        "aifs": lambda: download_ecmwf_grib(
+            "aifs", date_str, run_hour, forecast_hour, aifs_path
+        ),
+        "aigfs": lambda: download_aigfs_grib(
+            date_str, run_hour, forecast_hour, aigfs_path
+        ),
+    }
+    if forecast_hour <= 120:
+        download_jobs["icon"] = lambda: download_icon_grib(
+            date_str, run_hour, forecast_hour, icon_path
+        )
+    downloads = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(download_jobs)
+    ) as executor:
+        futures = {
+            name: executor.submit(download) for name, download in download_jobs.items()
+        }
+        for name, future in futures.items():
+            try:
+                downloads[name] = future.result()
+            except Exception as error:
+                print(f"      ⚠️ {name} download failed: {error}")
+                downloads[name] = False
     
     # ECMWF IFS (use filter_by_keys to avoid height conflicts)
-    if download_ecmwf_grib("ifs", date_str, run_hour, forecast_hour, ifs_path):
+    if downloads.get("ifs"):
         try:
             ds = xr.open_dataset(ifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
@@ -1694,7 +1742,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             if os.path.exists(ifs_path): os.remove(ifs_path)
             
     # ECMWF AIFS (use filter_by_keys to avoid height conflicts)
-    if download_ecmwf_grib("aifs", date_str, run_hour, forecast_hour, aifs_path):
+    if downloads.get("aifs"):
         try:
             ds = xr.open_dataset(aifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
@@ -1711,7 +1759,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             if os.path.exists(aifs_path): os.remove(aifs_path)
             
     # NOAA AIGFS (use filter_by_keys just in case)
-    if download_aigfs_grib(date_str, run_hour, forecast_hour, aigfs_path):
+    if downloads.get("aigfs"):
         try:
             ds = xr.open_dataset(aigfs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
@@ -1728,9 +1776,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             if os.path.exists(aigfs_path): os.remove(aigfs_path)
             
     # DWD ICON-EU ends at 120 hours; the global models continue to day 14.
-    if forecast_hour <= 120 and download_icon_grib(
-        date_str, run_hour, forecast_hour, icon_path
-    ):
+    if downloads.get("icon"):
         try:
             ds = xr.open_dataset(icon_path, engine='cfgrib')
             ds = normalize_dataset_coordinates(ds)

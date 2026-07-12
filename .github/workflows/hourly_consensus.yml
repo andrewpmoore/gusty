@@ -1,0 +1,102 @@
+name: Hourly Consensus Verification
+
+on:
+  schedule:
+    - cron: '12 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gusty-hourly-consensus
+  cancel-in-progress: true
+
+env:
+  AWS_DEFAULT_REGION: auto
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+
+jobs:
+  observations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Download worldwide METAR cache
+        run: curl --fail --retry 3 --user-agent 'Gusty Weather consensus/1.0' -o metars.csv.gz https://aviationweather.gov/data/cache/metars.cache.csv.gz
+      - name: Normalize active observations
+        run: python prepare_metar_data.py --cache metars.csv.gz --observations observations.json --stations stations.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metar-ground-truth
+          path: |
+            observations.json
+            stations.json
+          retention-days: 1
+
+  extract:
+    needs: observations
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [gfs, ifs, aifs, aigfs, icon]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install numpy xarray cfgrib requests scipy
+      - uses: actions/download-artifact@v4
+        with:
+          name: metar-ground-truth
+      - name: Download provider packs
+        run: |
+          mkdir -p public/data/models/${{ matrix.provider }}
+          aws s3 cp "s3://${R2_BUCKET}/current/models/manifest.json" public/data/models/manifest.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync "s3://${R2_BUCKET}/current/models/${{ matrix.provider }}" "public/data/models/${{ matrix.provider }}" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      - name: Extract forecasts at reporting stations
+        run: python extract_station_forecasts.py --provider '${{ matrix.provider }}' --stations-file stations.json --output '${{ matrix.provider }}.json'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forecast-${{ matrix.provider }}
+          path: ${{ matrix.provider }}.json
+          retention-days: 1
+
+  score:
+    needs: [observations, extract]
+    if: ${{ always() && needs.observations.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: forecast-*
+          path: forecasts
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: metar-ground-truth
+      - name: Restore previous weights
+        continue-on-error: true
+        run: aws s3 cp "s3://${R2_BUCKET}/state/weights.json" previous-weights.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      - name: Update EMA weights
+        run: |
+          provider_args=()
+          for file in forecasts/*.json; do provider_args+=(--provider-file "$file"); done
+          python consensus_pipeline.py "${provider_args[@]}" --stations-file stations.json --observations observations.json --previous-weights previous-weights.json --output weights.json
+      - name: Publish state and 90-day history
+        run: |
+          stamp="$(date -u +%Y/%m/%d/%H)"
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp weights.json "s3://${R2_BUCKET}/state/weights.json" --endpoint-url "$endpoint" --cache-control 'no-store'
+          aws s3 cp weights.json "s3://${R2_BUCKET}/history/verification/${stamp}/weights.json" --endpoint-url "$endpoint" --cache-control 'no-store'
+          aws s3 cp observations.json "s3://${R2_BUCKET}/history/verification/${stamp}/observations.json" --endpoint-url "$endpoint" --cache-control 'no-store'
