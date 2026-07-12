@@ -14,7 +14,8 @@ import fetch_weather_data as weather
 
 
 def read_pack(path):
-    data = open(path, "rb").read()
+    with open(path, "rb") as file:
+        data = file.read()
     if data[:4] != weather.PACK_MAGIC:
         raise ValueError("Invalid gpack")
     count = struct.unpack_from("<H", data, 5)[0]

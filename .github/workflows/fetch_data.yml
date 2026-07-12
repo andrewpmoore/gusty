@@ -2,75 +2,111 @@ name: Fetch Weather Data
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - 'fetch_weather_data.py'
-      - 'consensus_pipeline.py'
-      - 'extract_station_forecasts.py'
-      - 'publish_r2.py'
-      - '.github/workflows/fetch_data.yml'
+      - fetch_weather_data.py
+      - assemble_model_packs.py
+      - publish_r2.py
+      - .github/workflows/fetch_data.yml
   schedule:
     - cron: '30 4,10,16,22 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: gusty-data-deploy
+  group: gusty-forecast-build
   cancel-in-progress: false
 
-jobs:
-  update-weather:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+env:
+  AWS_DEFAULT_REGION: auto
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
 
-      - name: Install System Dependencies
+jobs:
+  layers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libeccodes0 libeccodes-dev
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install Python Libraries
+      - run: pip install requests xarray cfgrib numpy scipy argparse boto3
+      - name: Generate non-radar map layers
+        run: python fetch_weather_data.py --type all --skip-model-providers
+      - name: Upload layer artifact to R2
         run: |
-          pip install requests xarray cfgrib numpy scipy argparse boto3
+          tar --exclude='models' -C public/data -czf layers.tar.gz .
+          aws s3 cp layers.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers.tar.gz" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-      - name: Restore Consensus State from R2
-        continue-on-error: true
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+  provider:
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [gfs, ifs, aifs, aigfs, icon]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
         run: |
-          mkdir -p .consensus_state
-          aws s3 cp \
-            "s3://${R2_BUCKET}/state/weights.json" \
-            .consensus_state/weights.json \
-            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-      - name: Run Fetch Script
-        env:
-          CONSENSUS_WEIGHTS_FILE: .consensus_state/weights.json
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libeccodes-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install requests xarray cfgrib numpy scipy argparse
+      - name: Generate ${{ matrix.provider }} provider packs
+        run: python fetch_weather_data.py --type temp --model-provider '${{ matrix.provider }}'
+      - name: Validate provider artifact
         run: |
-          # This script cleans public/data locally and then fills it with new JSONs
-          python fetch_weather_data.py --type all
+          test -d "public/data/models/${{ matrix.provider }}"
+          jq -e '.models["${{ matrix.provider }}"]' public/data/models/manifest.json > "public/data/models/${{ matrix.provider }}.json"
+          jq -r '.ref_time' public/data/models/manifest.json > public/data/models/reference_time.txt
+      - name: Upload provider artifact directly to R2
+        run: |
+          tar -C public/data/models -czf provider.tar.gz '${{ matrix.provider }}' '${{ matrix.provider }}.json' reference_time.txt
+          aws s3 cp provider.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/providers/${{ matrix.provider }}.tar.gz" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-      - name: Publish Versioned Forecast to R2
+  assemble:
+    needs: [layers, provider]
+    if: ${{ always() && needs.layers.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install requests xarray cfgrib numpy scipy argparse boto3
+      - name: Download layer and provider artifacts
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          mkdir -p public/data/models provider_archives
+          aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers.tar.gz" layers.tar.gz --endpoint-url "$endpoint"
+          tar -C public/data -xzf layers.tar.gz
+          for provider in gfs ifs aifs aigfs icon; do
+            if aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/providers/${provider}.tar.gz" "provider_archives/${provider}.tar.gz" --endpoint-url "$endpoint"; then
+              tar -C public/data/models -xzf "provider_archives/${provider}.tar.gz"
+            fi
+          done
+      - name: Assemble consensus and multi-forecast packs
+        run: |
+          test "$(find public/data/models -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 2
+          reference_time="$(head -1 public/data/models/reference_time.txt)"
+          aws s3 cp "s3://${R2_BUCKET}/state/weights.json" weights.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" || true
+          python assemble_model_packs.py --models-dir public/data/models --reference-time "$reference_time" --weights weights.json
+          jq -e '.models.consensus' public/data/models/manifest.json
+      - name: Publish compressed versioned forecast
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          python publish_r2.py --source public/data --dataset forecast \
-            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"
+          python publish_r2.py --source public/data --dataset forecast --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"

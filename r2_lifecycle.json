@@ -7,6 +7,12 @@
       "Expiration": {"Days": 90}
     },
     {
+      "ID": "expire-build-staging-1-day",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "staging/"},
+      "Expiration": {"Days": 1}
+    },
+    {
       "ID": "expire-forecast-runs-3-days",
       "Status": "Enabled",
       "Filter": {"Prefix": "forecast/runs/"},

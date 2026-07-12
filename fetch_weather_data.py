@@ -346,6 +346,8 @@ CONSENSUS_PARTICIPATION_CHANNELS = {
 CONSENSUS_QUALITY_FIELDS = {"temperature", "precipitation", "condition_code"}
 
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
+ACTIVE_MODEL_PROVIDER = None
+SKIP_MODEL_PROVIDERS = False
 MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon")
 MULTI_FORECAST_HIGH_CHANNELS = {
     model: 20 + index for index, model in enumerate(MULTI_FORECAST_MODELS)
@@ -1267,7 +1269,7 @@ def compact_consensus_tiles():
         )
     return sorted(hours), available_channels
 
-def compact_model_provider_tiles(reference_time):
+def compact_model_provider_tiles(reference_time, provider_only=None):
     """Pack one location tile's forecast day into one CDN-friendly file."""
     output_root = os.path.join(OUTPUT_DIR, "models")
     os.makedirs(output_root, exist_ok=True)
@@ -1278,10 +1280,13 @@ def compact_model_provider_tiles(reference_time):
         "field_channels": MODEL_FIELD_CHANNELS,
         "models": {},
     }
-    # Build cross-model products before deleting provider intermediates.
-    consensus_hours, consensus_channels = compact_consensus_tiles()
-    compact_multi_forecast_tiles()
-    for model_name in MODEL_PROVIDER_IDS:
+    consensus_hours, consensus_channels = [], set()
+    if provider_only is None:
+        # Build cross-model products before deleting provider intermediates.
+        consensus_hours, consensus_channels = compact_consensus_tiles()
+        compact_multi_forecast_tiles()
+    provider_ids = (provider_only,) if provider_only else MODEL_PROVIDER_IDS
+    for model_name in provider_ids:
         source_dir = os.path.join(MODEL_WORK_DIR, model_name)
         if not os.path.isdir(source_dir):
             continue
@@ -1402,7 +1407,7 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
                 subset_max = max_grid.sel(latitude=slice(lat_end, lat_start), longitude=slice(lon_start, lon_end)).values
 
             subset_model_grids = {}
-            if job_type == "temp":
+            if job_type == "temp" and not SKIP_MODEL_PROVIDERS:
                 subset_model_grids = {
                     model_name: model_grid.sel(
                         latitude=slice(lat_end, lat_start),
@@ -1699,9 +1704,11 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
         return None, None, None, None
         
     models_temps = {"gfs": gfs_temp}
-    provider_fields = {
-        "gfs": extract_provider_fields("gfs", gfs_grib_path, gfs_temp, gfs_temp)
-    }
+    provider_fields = {}
+    if ACTIVE_MODEL_PROVIDER in (None, "gfs"):
+        provider_fields["gfs"] = extract_provider_fields(
+            "gfs", gfs_grib_path, gfs_temp, gfs_temp
+        )
     
     # Output paths
     ifs_path = os.path.join(OUTPUT_DIR, f"temp_variance_ifs_{forecast_hour}.grib2")
@@ -1709,7 +1716,7 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
     aigfs_path = os.path.join(OUTPUT_DIR, f"temp_variance_aigfs_{forecast_hour}.grib2")
     icon_path = os.path.join(OUTPUT_DIR, f"temp_variance_icon_{forecast_hour}.grib2")
 
-    download_jobs = {
+    all_download_jobs = {
         "ifs": lambda: download_ecmwf_grib(
             "ifs", date_str, run_hour, forecast_hour, ifs_path
         ),
@@ -1721,22 +1728,28 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
         ),
     }
     if forecast_hour <= 120:
-        download_jobs["icon"] = lambda: download_icon_grib(
+        all_download_jobs["icon"] = lambda: download_icon_grib(
             date_str, run_hour, forecast_hour, icon_path
         )
+    download_jobs = {
+        name: job for name, job in all_download_jobs.items()
+        if ACTIVE_MODEL_PROVIDER in (None, name)
+    }
     downloads = {}
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(download_jobs)
-    ) as executor:
-        futures = {
-            name: executor.submit(download) for name, download in download_jobs.items()
-        }
-        for name, future in futures.items():
-            try:
-                downloads[name] = future.result()
-            except Exception as error:
-                print(f"      ⚠️ {name} download failed: {error}")
-                downloads[name] = False
+    if download_jobs:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(download_jobs)
+        ) as executor:
+            futures = {
+                name: executor.submit(download)
+                for name, download in download_jobs.items()
+            }
+            for name, future in futures.items():
+                try:
+                    downloads[name] = future.result()
+                except Exception as error:
+                    print(f"      ⚠️ {name} download failed: {error}")
+                    downloads[name] = False
     
     # ECMWF IFS (use filter_by_keys to avoid height conflicts)
     if downloads.get("ifs"):
@@ -1872,9 +1885,10 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
         return min_grid, max_grid, aligned_model_grids, provider_fields
     else:
         print("      ⚠️ No other models downloaded. Using GFS values for min/max.")
-        write_model_provider_hour(
-            "gfs", forecast_hour, provider_fields["gfs"]
-        )
+        if "gfs" in provider_fields:
+            write_model_provider_hour(
+                "gfs", forecast_hour, provider_fields["gfs"]
+            )
         return gfs_temp, gfs_temp, {"gfs": gfs_temp}, provider_fields
 
 def first_data_array(ds):
@@ -2116,9 +2130,19 @@ def download_and_process(job_type, date, run_hour, forecast_hour):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", help="Data type to fetch", default="all")
+    parser.add_argument(
+        "--model-provider", choices=MODEL_PROVIDER_IDS,
+        help="Generate one independently publishable model provider artifact",
+    )
+    parser.add_argument(
+        "--skip-model-providers", action="store_true",
+        help="Generate map layers without acquiring model provider packs",
+    )
     args = parser.parse_args()
+    ACTIVE_MODEL_PROVIDER = args.model_provider
+    SKIP_MODEL_PROVIDERS = args.skip_model_providers
 
-    if args.type == "all":
+    if args.type == "all" or args.model_provider:
         print("--- Cleaning Output Directory ---")
         clean_output_directory()
 
@@ -2158,8 +2182,10 @@ if __name__ == "__main__":
             if "metadata" in NOAA_CONFIG[job]:
                 manifest_entry["metadata"] = NOAA_CONFIG[job]["metadata"]
             manifest_updates[job] = manifest_entry
-            if job == "temp":
-                compact_model_provider_tiles(job_ref_time)
+            if job == "temp" and not args.skip_model_providers:
+                compact_model_provider_tiles(
+                    job_ref_time, provider_only=args.model_provider
+                )
 
     if manifest_updates:
         print("\n✅ Batch Complete.")

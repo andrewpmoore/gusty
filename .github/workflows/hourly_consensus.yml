@@ -63,6 +63,10 @@ jobs:
           run="$(jq -r .run forecast-current.json)"
           aws s3 cp "s3://${R2_BUCKET}/forecast/${run}/models/manifest.json" public/data/models/manifest.json --endpoint-url "$endpoint"
           aws s3 sync "s3://${R2_BUCKET}/forecast/${run}/models/${{ matrix.provider }}" "public/data/models/${{ matrix.provider }}" --endpoint-url "$endpoint"
+          find public/data/models -type f -print0 | while IFS= read -r -d '' file; do
+            gzip -cd "$file" > "$file.decoded"
+            mv "$file.decoded" "$file"
+          done
       - name: Extract forecasts at reporting stations
         run: python extract_station_forecasts.py --provider '${{ matrix.provider }}' --stations-file stations.json --output '${{ matrix.provider }}.json'
       - uses: actions/upload-artifact@v4
