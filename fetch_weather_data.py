@@ -1006,6 +1006,70 @@ def compact_multi_forecast_tiles():
                 os.path.join(output_dir, f"{tile}.gpack"), day_entries
             )
 
+def compact_consensus_tiles():
+    """Build one robust median/vote forecast from all available models."""
+    output_dir = os.path.join(OUTPUT_DIR, "models", "consensus")
+    os.makedirs(output_dir, exist_ok=True)
+    indexed = {}
+    for model_name in MODEL_PROVIDER_IDS:
+        source_dir = os.path.join(MODEL_WORK_DIR, model_name)
+        if not os.path.isdir(source_dir):
+            continue
+        for filename in os.listdir(source_dir):
+            hour_text, tile_filename = filename.split("h_", 1)
+            tile = tile_filename.removesuffix(".gtile")
+            indexed.setdefault((tile, int(hour_text)), []).append(
+                os.path.join(source_dir, filename)
+            )
+
+    hours = set()
+    available_channels = set()
+    tile_entries = {}
+    for (tile, forecast_hour), paths in indexed.items():
+        model_channels = []
+        geometry = None
+        for path in paths:
+            lon_vals, lat_vals, dx, dy, channels = read_binary_tile(path)
+            geometry = (lon_vals, lat_vals, dx, dy)
+            model_channels.append(channels)
+        if geometry is None:
+            continue
+
+        components = []
+        for field_name, channel in MODEL_FIELD_CHANNELS.items():
+            values = [item[channel] for item in model_channels if channel in item]
+            if not values:
+                continue
+            stack = np.stack(values)
+            if field_name == "condition_code":
+                rounded = np.rint(stack).astype(np.int16)
+                counts = np.stack([
+                    np.sum(rounded == code, axis=0) for code in range(16)
+                ])
+                if len(values) > 1:
+                    counts[CONDITION_CODES["Unknown"]] = 0
+                consensus = np.argmax(counts, axis=0).astype(np.float32)
+            else:
+                consensus = np.median(stack, axis=0).astype(np.float32)
+            components.append((channel, prepare_grid_values(consensus, 3)))
+            available_channels.add(channel)
+        if not components:
+            continue
+        lon_vals, lat_vals, dx, dy = geometry
+        tile_entries.setdefault(tile, []).append((
+            forecast_hour,
+            build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components),
+        ))
+        hours.add(forecast_hour)
+
+    for tile, entries in tile_entries.items():
+        entries.sort(key=lambda item: item[0])
+        write_tile_pack(
+            os.path.join(output_dir, f"{tile}.gpack"),
+            [(str(hour), tile_bytes) for hour, tile_bytes in entries],
+        )
+    return sorted(hours), available_channels
+
 def compact_model_provider_tiles(reference_time):
     """Pack one location tile's forecast day into one CDN-friendly file."""
     output_root = os.path.join(OUTPUT_DIR, "models")
@@ -1059,6 +1123,18 @@ def compact_model_provider_tiles(reference_time):
             "fields": [
                 field_name for field_name, channel in MODEL_FIELD_CHANNELS.items()
                 if channel in available_channels
+            ],
+        }
+    consensus_hours, consensus_channels = compact_consensus_tiles()
+    if consensus_hours:
+        manifest["models"]["consensus"] = {
+            "forecast_hours": consensus_hours,
+            "day_count": max(hour // 24 for hour in consensus_hours) + 1,
+            "pack_layout": "complete_horizon",
+            "fields": [
+                field_name
+                for field_name, channel in MODEL_FIELD_CHANNELS.items()
+                if channel in consensus_channels
             ],
         }
     with open(os.path.join(output_root, "manifest.json"), "w") as file:
