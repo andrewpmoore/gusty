@@ -2163,6 +2163,10 @@ if __name__ == "__main__":
         forecast_hours = (
             TEMPERATURE_HOURS_TO_FETCH if job == "temp" else HOURS_TO_FETCH
         )
+        if job == "temp" and args.model_provider == "icon":
+            forecast_hours = [
+                hour for hour in forecast_hours if hour <= 120
+            ]
         for hour in forecast_hours:
             ref_time, count, pack_count = download_and_process(job, date, run, hour)
             if ref_time: job_ref_time = ref_time
