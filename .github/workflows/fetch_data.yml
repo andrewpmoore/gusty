@@ -79,6 +79,7 @@ jobs:
     needs: [layers, provider]
     if: ${{ always() && needs.layers.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
