@@ -1,6 +1,12 @@
 name: Publish City Weather to R2
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - city.py
+      - publish_r2.py
+      - .github/workflows/schedule_workflow.yml
   schedule:
     - cron: '0 1,13 * * *'  # Schedule to run every day at 1 am and 1pm
   workflow_dispatch:

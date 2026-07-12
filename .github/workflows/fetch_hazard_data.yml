@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: gusty-data-deploy
-  cancel-in-progress: false
+  group: gusty-hazards
+  cancel-in-progress: true
 
 jobs:
   update-hazards:

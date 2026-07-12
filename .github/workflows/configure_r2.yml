@@ -1,11 +1,6 @@
 name: Configure Weather R2
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - r2_lifecycle.json
-      - .github/workflows/configure_r2.yml
   workflow_dispatch:
 
 permissions:
