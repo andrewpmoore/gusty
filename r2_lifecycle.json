@@ -7,12 +7,6 @@
       "Expiration": {"Days": 90}
     },
     {
-      "ID": "expire-immutable-forecast-runs-7-days",
-      "Status": "Enabled",
-      "Filter": {"Prefix": "runs/"},
-      "Expiration": {"Days": 7}
-    },
-    {
       "ID": "abort-incomplete-uploads-7-days",
       "Status": "Enabled",
       "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}

@@ -343,6 +343,7 @@ CONSENSUS_SPREAD_CHANNELS = {
 CONSENSUS_PARTICIPATION_CHANNELS = {
     field: 80 + index for index, field in enumerate(MODEL_FIELD_CHANNELS)
 }
+CONSENSUS_QUALITY_FIELDS = {"temperature", "precipitation", "condition_code"}
 
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
 MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon")
@@ -1225,28 +1226,29 @@ def compact_consensus_tiles():
                 channel,
                 prepare_grid_values(consensus, 3, preserve_missing=True),
             ))
-            participation = np.full(
-                consensus.shape, family_count, dtype=np.float32
-            )
-            confidence = _confidence_from_spread(
-                field_name, spread, family_count
-            )
-            components.extend([
-                (
-                    CONSENSUS_CONFIDENCE_CHANNELS[field_name],
-                    prepare_grid_values(confidence, 3, preserve_missing=True),
-                ),
-                (
-                    CONSENSUS_SPREAD_CHANNELS[field_name],
-                    prepare_grid_values(spread, 3, preserve_missing=True),
-                ),
-                (
-                    CONSENSUS_PARTICIPATION_CHANNELS[field_name],
-                    prepare_grid_values(
-                        participation, 0, preserve_missing=True
+            if field_name in CONSENSUS_QUALITY_FIELDS:
+                participation = np.full(
+                    consensus.shape, family_count, dtype=np.float32
+                )
+                confidence = _confidence_from_spread(
+                    field_name, spread, family_count
+                )
+                components.extend([
+                    (
+                        CONSENSUS_CONFIDENCE_CHANNELS[field_name],
+                        prepare_grid_values(confidence, 3, preserve_missing=True),
                     ),
-                ),
-            ])
+                    (
+                        CONSENSUS_SPREAD_CHANNELS[field_name],
+                        prepare_grid_values(spread, 3, preserve_missing=True),
+                    ),
+                    (
+                        CONSENSUS_PARTICIPATION_CHANNELS[field_name],
+                        prepare_grid_values(
+                            participation, 0, preserve_missing=True
+                        ),
+                    ),
+                ])
             available_channels.add(channel)
         if not components:
             continue
@@ -1276,6 +1278,9 @@ def compact_model_provider_tiles(reference_time):
         "field_channels": MODEL_FIELD_CHANNELS,
         "models": {},
     }
+    # Build cross-model products before deleting provider intermediates.
+    consensus_hours, consensus_channels = compact_consensus_tiles()
+    compact_multi_forecast_tiles()
     for model_name in MODEL_PROVIDER_IDS:
         source_dir = os.path.join(MODEL_WORK_DIR, model_name)
         if not os.path.isdir(source_dir):
@@ -1311,6 +1316,8 @@ def compact_model_provider_tiles(reference_time):
                 os.path.join(model_dir, f"{tile}.gpack"),
                 [(str(hour), path) for hour, path in entries],
             )
+            for _, path in entries:
+                os.remove(path)
         manifest["models"][model_name] = {
             "forecast_hours": sorted(available_hours),
             "day_count": max((hour // 24 for hour in available_hours), default=-1) + 1,
@@ -1320,7 +1327,6 @@ def compact_model_provider_tiles(reference_time):
                 if channel in available_channels
             ],
         }
-    consensus_hours, consensus_channels = compact_consensus_tiles()
     if consensus_hours:
         manifest["models"]["consensus"] = {
             "forecast_hours": consensus_hours,
@@ -1332,16 +1338,24 @@ def compact_model_provider_tiles(reference_time):
                 if channel in consensus_channels
             ],
             "quality_channels": {
-                "confidence": CONSENSUS_CONFIDENCE_CHANNELS,
-                "spread": CONSENSUS_SPREAD_CHANNELS,
-                "participating_families": CONSENSUS_PARTICIPATION_CHANNELS,
+                "confidence": {
+                    field: CONSENSUS_CONFIDENCE_CHANNELS[field]
+                    for field in CONSENSUS_QUALITY_FIELDS
+                },
+                "spread": {
+                    field: CONSENSUS_SPREAD_CHANNELS[field]
+                    for field in CONSENSUS_QUALITY_FIELDS
+                },
+                "participating_families": {
+                    field: CONSENSUS_PARTICIPATION_CHANNELS[field]
+                    for field in CONSENSUS_QUALITY_FIELDS
+                },
             },
             "model_families": MODEL_FAMILIES,
             "minimum_independent_families": 2,
         }
     with open(os.path.join(output_root, "manifest.json"), "w") as file:
         json.dump(manifest, file, indent=2)
-    compact_multi_forecast_tiles()
     if os.path.isdir(MODEL_WORK_DIR):
         shutil.rmtree(MODEL_WORK_DIR)
 
