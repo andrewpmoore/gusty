@@ -20,6 +20,29 @@ env:
   R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.pointer.outputs.available }}
+    steps:
+      - name: Resolve current forecast
+        id: pointer
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          if aws s3 cp "s3://${R2_BUCKET}/forecast/current.json" forecast-current.json --endpoint-url "$endpoint"; then
+            jq -e '.run | strings | length > 0' forecast-current.json
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Forecast data has not been published yet; verification will resume after the first successful forecast build."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: steps.pointer.outputs.available == 'true'
+        with:
+          name: current-forecast-pointer
+          path: forecast-current.json
+          retention-days: 1
+
   observations:
     runs-on: ubuntu-latest
     steps:
@@ -40,7 +63,8 @@ jobs:
           retention-days: 1
 
   extract:
-    needs: observations
+    needs: [forecast, observations]
+    if: needs.forecast.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -55,11 +79,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: metar-ground-truth
+      - uses: actions/download-artifact@v4
+        with:
+          name: current-forecast-pointer
       - name: Download provider packs
         run: |
           mkdir -p public/data/models/${{ matrix.provider }}
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 cp "s3://${R2_BUCKET}/forecast/current.json" forecast-current.json --endpoint-url "$endpoint"
           run="$(jq -r .run forecast-current.json)"
           aws s3 cp "s3://${R2_BUCKET}/forecast/${run}/models/manifest.json" public/data/models/manifest.json --endpoint-url "$endpoint"
           aws s3 sync "s3://${R2_BUCKET}/forecast/${run}/models/${{ matrix.provider }}" "public/data/models/${{ matrix.provider }}" --endpoint-url "$endpoint"
@@ -77,7 +103,7 @@ jobs:
 
   score:
     needs: [observations, extract]
-    if: ${{ always() && needs.observations.result == 'success' }}
+    if: ${{ always() && needs.observations.result == 'success' && needs.extract.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
