@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: gusty-data-deploy
@@ -43,17 +43,25 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python Libraries
-        run: pip install requests
+        run: pip install requests boto3
 
-      - name: Clone Data Repository
+      - name: Restore Previous Hazard Run
+        continue-on-error: true
         env:
-          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" gusty_data_repo || true
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://${R2_BUCKET}/hazards/current.json" hazard-current.json --endpoint-url "$endpoint"
+          prefix="$(jq -r .run hazard-current.json)"
+          aws s3 sync "s3://${R2_BUCKET}/hazards/${prefix}" previous_hazards --endpoint-url "$endpoint"
 
       - name: Fetch Hazard Layers
         env:
-          GUSTY_PREVIOUS_DATA_DIR: gusty_data_repo
+          GUSTY_PREVIOUS_DATA_DIR: previous_hazards
           GUSTY_USER_AGENT: "GustyWeather/1.0 (https://gustyweather.com; weather-data-ingestion)"
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
           METEOALARM_FEEDS: ${{ vars.METEOALARM_FEEDS }}
@@ -65,36 +73,17 @@ jobs:
           FIJI_RSMC_ALERTS_GEOJSON_URL: ${{ vars.FIJI_RSMC_ALERTS_GEOJSON_URL }}
           JTWC_ALERTS_GEOJSON_URL: ${{ vars.JTWC_ALERTS_GEOJSON_URL }}
         # The output of this script is redirected to /dev/null to prevent log bloat
-        run: python fetch_hazard_data.py --previous-dir gusty_data_repo > /dev/null 2>&1
+        run: python fetch_hazard_data.py --previous-dir previous_hazards > /dev/null 2>&1
 
-      - name: Deploy Hazard Data
+      - name: Publish Versioned Hazards to R2
         env:
-          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          cd gusty_data_repo
-          
-          if [ ! -d ".git" ]; then
-            git init
-            git branch -M main
-            echo "Init" > init.txt
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          rm -rf hazards layers
-          cp -a ../public/data/hazards ./hazards
-          cp -a ../public/data/layers ./layers
-          
-          git add .
-          git commit --allow-empty -m "Latest Hazard Data: $(date -u)"
-          
-          for attempt in 1 2 3; do
-            if git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force; then
-              exit 0
-            fi
-            if [ "$attempt" = "3" ]; then
-              exit 1
-            fi
-            sleep 10
-          done
+          mkdir -p hazard_payload
+          cp -a public/data/hazards hazard_payload/hazards
+          cp -a public/data/layers hazard_payload/layers
+          python publish_r2.py --source hazard_payload --dataset hazards \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"

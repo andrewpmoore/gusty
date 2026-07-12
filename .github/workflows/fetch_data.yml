@@ -8,6 +8,7 @@ on:
       - 'fetch_weather_data.py'
       - 'consensus_pipeline.py'
       - 'extract_station_forecasts.py'
+      - 'publish_r2.py'
       - '.github/workflows/fetch_data.yml'
   schedule:
     - cron: '30 4,10,16,22 * * *'
@@ -40,7 +41,7 @@ jobs:
 
       - name: Install Python Libraries
         run: |
-          pip install requests xarray cfgrib numpy scipy argparse
+          pip install requests xarray cfgrib numpy scipy argparse boto3
 
       - name: Restore Consensus State from R2
         continue-on-error: true
@@ -64,73 +65,12 @@ jobs:
           # This script cleans public/data locally and then fills it with new JSONs
           python fetch_weather_data.py --type all
 
-      - name: Upload Current Forecasts to R2
+      - name: Publish Versioned Forecast to R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 sync public/data "s3://${R2_BUCKET}/current" \
-            --delete \
-            --endpoint-url "$endpoint" \
-            --cache-control "public,max-age=300,stale-while-revalidate=3600"
-          printf '{"schema":1,"run":"current","published_at":"%s"}\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > current.json
-          aws s3 cp current.json "s3://${R2_BUCKET}/current.json" \
-            --endpoint-url "$endpoint" \
-            --cache-control "no-cache"
-
-      - name: Deploy Data (Keep Exactly 2 Commits)
-        env:
-          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
-        run: |
-          # 1. Download the PREVIOUS state of your data repo (depth=1 gets only the latest files)
-          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" previous_data || true
-          
-          # 2. Remove the downloaded .git folder so we can build a brand new history
-          rm -rf previous_data/.git
-          
-          # 3. Create a staging area for our deployment
-          mkdir deploy_staging
-          cd deploy_staging
-          
-          # Initialize a fresh git repository
-          git init
-          git branch -M main
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 4. Commit the OLD data (This becomes Commit #1)
-          if [ -d "../previous_data" ]; then
-            cp -a ../previous_data/. .
-            git add .
-            git commit -m "Previous Weather Data"
-          else
-            # Failsafe for the very first run
-            echo "Init" > init.txt
-            git add init.txt
-            git commit -m "Initial Commit"
-          fi
-          
-          # 5. Commit the NEW data (This becomes Commit #2)
-          # Large model packs live only in R2; GitHub remains a legacy fallback
-          # for the smaller map, hazard and tide products.
-          rsync -a --exclude 'models/' ../public/data/ .
-          git add .
-          
-          # ADDED --allow-empty HERE to prevent crashing when data is identical
-          git commit --allow-empty -m "Latest Weather Data: $(date -u)"
-          
-          # 6. Force Push with retry for transient remote ref lock races
-          for attempt in 1 2 3; do
-            if git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force; then
-              exit 0
-            fi
-            if [ "$attempt" = "3" ]; then
-              exit 1
-            fi
-            sleep 10
-          done
+          python publish_r2.py --source public/data --dataset forecast \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"

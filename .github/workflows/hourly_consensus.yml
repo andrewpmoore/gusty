@@ -58,8 +58,11 @@ jobs:
       - name: Download provider packs
         run: |
           mkdir -p public/data/models/${{ matrix.provider }}
-          aws s3 cp "s3://${R2_BUCKET}/current/models/manifest.json" public/data/models/manifest.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 sync "s3://${R2_BUCKET}/current/models/${{ matrix.provider }}" "public/data/models/${{ matrix.provider }}" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://${R2_BUCKET}/forecast/current.json" forecast-current.json --endpoint-url "$endpoint"
+          run="$(jq -r .run forecast-current.json)"
+          aws s3 cp "s3://${R2_BUCKET}/forecast/${run}/models/manifest.json" public/data/models/manifest.json --endpoint-url "$endpoint"
+          aws s3 sync "s3://${R2_BUCKET}/forecast/${run}/models/${{ matrix.provider }}" "public/data/models/${{ matrix.provider }}" --endpoint-url "$endpoint"
       - name: Extract forecasts at reporting stations
         run: python extract_station_forecasts.py --provider '${{ matrix.provider }}' --stations-file stations.json --output '${{ matrix.provider }}.json'
       - uses: actions/upload-artifact@v4

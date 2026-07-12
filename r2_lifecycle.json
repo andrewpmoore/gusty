@@ -7,6 +7,24 @@
       "Expiration": {"Days": 90}
     },
     {
+      "ID": "expire-forecast-runs-3-days",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "forecast/runs/"},
+      "Expiration": {"Days": 3}
+    },
+    {
+      "ID": "expire-hazard-runs-2-days",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "hazards/runs/"},
+      "Expiration": {"Days": 2}
+    },
+    {
+      "ID": "expire-city-runs-7-days",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "cities/runs/"},
+      "Expiration": {"Days": 7}
+    },
+    {
       "ID": "abort-incomplete-uploads-7-days",
       "Status": "Enabled",
       "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}

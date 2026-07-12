@@ -1,4 +1,4 @@
-name: Daily City Script and Deploy to GitHub Pages
+name: Publish City Weather to R2
 
 on:
   schedule:
@@ -23,24 +23,22 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install -r requirements.txt  # If you have any dependencies
+          pip install -r requirements.txt boto3
 
       - name: Run City Script
         run: python city.py locations.txt
 
-      - name: Move JSON File to data Directory
+      - name: Prepare City Data
         run: |
-          mkdir -p data
-          mv world_weather.json data/world_weather.json
+          mkdir -p city_payload
+          mv world_weather.json city_payload/world_weather.json
 
-      - name: Configure Git
+      - name: Publish Versioned City Data to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
-
-      - name: Commit and Push to Main
-        run: |
-          git add data/world_weather.json
-          git commit -m "Deploy world_weather.json to GitHub Pages"
-          git pull origin main
-          git push origin main
+          python publish_r2.py --source city_payload --dataset cities \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"

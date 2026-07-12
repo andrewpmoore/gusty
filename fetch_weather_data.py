@@ -2125,7 +2125,10 @@ if __name__ == "__main__":
     date, run = get_latest_run_time()
     print(f"--- Starting Fetch: {date} {run}z ---")
 
-    jobs = list(NOAA_CONFIG.keys()) if args.type == "all" else [args.type]
+    jobs = (
+        [name for name in NOAA_CONFIG if not name.startswith("radar_")]
+        if args.type == "all" else [args.type]
+    )
     manifest_updates = {}
     
     for job in jobs:
