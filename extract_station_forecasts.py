@@ -38,18 +38,29 @@ def extract(provider, model_dir, manifest, stations):
             temperature = value(tile, station, "temperature")
             wind_u = value(tile, station, "wind_u")
             wind_v = value(tile, station, "wind_v")
+            dewpoint = value(tile, station, "dewpoint")
+            pressure = value(tile, station, "pressure")
+            precipitation = value(tile, station, "precipitation")
             rows.append({
                 "station": station["icao"],
+                "latitude": station["latitude"],
+                "longitude": station["longitude"],
+                "lead_hours": int(hour_text),
                 "valid_time": (
                     reference + dt.timedelta(hours=int(hour_text))
                 ).isoformat().replace("+00:00", "Z"),
                 "temperature_c": (
                     temperature - 273.15 if temperature is not None else None
                 ),
+                "dewpoint_c": (
+                    dewpoint - 273.15 if dewpoint is not None else None
+                ),
                 "wind_kmh": (
                     math.hypot(wind_u, wind_v) * 3.6
                     if wind_u is not None and wind_v is not None else None
                 ),
+                "pressure_hpa": pressure / 100.0 if pressure is not None else None,
+                "precipitation_mm": precipitation,
             })
     return {"schema": 1, "provider": provider, "forecasts": rows}
 

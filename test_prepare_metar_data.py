@@ -12,7 +12,10 @@ class PrepareMetarTests(unittest.TestCase):
                 "latitude": "51.48",
                 "longitude": "-0.45",
                 "temp_c": "21.0",
+                "dewpoint_c": "12.0",
                 "wind_speed_kt": "10",
+                "sea_level_pressure_mb": "1013.2",
+                "precip_in": "0.01",
             },
             {
                 "station_id": "EGLL",
@@ -26,6 +29,9 @@ class PrepareMetarTests(unittest.TestCase):
         observations, stations = metar.normalize(rows)
         self.assertEqual(len(observations), 2)
         self.assertEqual(stations[0]["icao"], "EGLL")
+        self.assertEqual(observations[0]["dewpoint"], 12.0)
+        self.assertEqual(observations[0]["pressure_hpa"], 1013.2)
+        self.assertEqual(observations[0]["precipitation_in"], 0.01)
         self.assertIsNone(observations[1]["wspd"])
 
 

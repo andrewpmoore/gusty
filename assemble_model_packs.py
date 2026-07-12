@@ -2,6 +2,7 @@
 """Assemble provider horizon packs into consensus and multi-model products."""
 
 import argparse
+import datetime as dt
 import json
 import os
 import pathlib
@@ -10,6 +11,7 @@ import numpy as np
 
 import fetch_weather_data as weather
 import validate_consensus as packed
+import consensus_pipeline as learning
 
 
 def geometry_arrays(tile):
@@ -24,7 +26,7 @@ def geometry_arrays(tile):
     )
 
 
-def components_for_hour(contributors, skill_weights=None):
+def components_for_hour(contributors, skill_weights=None, temperature_bias=0.0):
     components = []
     available = set()
     for field_name, channel in weather.MODEL_FIELD_CHANNELS.items():
@@ -57,6 +59,8 @@ def components_for_hour(contributors, skill_weights=None):
             ))
         else:
             consensus = weather._weighted_median(stack, weights)
+        if field_name == "temperature" and temperature_bias:
+            consensus = consensus + temperature_bias
         components.append((
             channel,
             weather.prepare_grid_values(consensus, 3, preserve_missing=True),
@@ -65,7 +69,25 @@ def components_for_hour(contributors, skill_weights=None):
     return components, available
 
 
-def assemble(root, reference_time, skill_weights=None):
+def regional_learning(state, latitude, longitude, forecast_hour, reference_time):
+    region = learning.region_key(latitude, longitude)
+    regional = state.get("regions", {}).get(region, {})
+    bucket = learning.lead_bucket(forecast_hour)
+    weights = regional.get("lead_buckets", {}).get(bucket, {}).get("weights")
+    if not weights:
+        weights = state.get("weights", {})
+    reference = learning.parse_time(reference_time)
+    valid = reference + dt.timedelta(hours=int(forecast_hour))
+    local_hour = (valid.hour + longitude / 15.0) % 24
+    period = "night" if local_hour >= 21 or local_hour < 6 else "day"
+    bias = regional.get("temperature_bias", {}).get(period, {})
+    bias_value = float(bias.get("value", 0.0)) if int(
+        bias.get("samples", 0)
+    ) >= 3 else 0.0
+    return weights, bias_value
+
+
+def assemble(root, reference_time, learning_state=None):
     root = pathlib.Path(root)
     output = root / "consensus"
     multi_output = root / "multi"
@@ -74,6 +96,7 @@ def assemble(root, reference_time, skill_weights=None):
     providers = [
         name for name in weather.MODEL_PROVIDER_IDS if (root / name).is_dir()
     ]
+    learning_state = learning_state or {}
     tile_names = sorted({
         path.name for name in providers for path in (root / name).glob("*.gpack")
     })
@@ -91,15 +114,23 @@ def assemble(root, reference_time, skill_weights=None):
                 (name, document[hour][4])
                 for name, document in documents.items() if hour in document
             ]
+            example_tile = next(
+                document[hour] for document in documents.values() if hour in document
+            )
+            geometry = geometry_arrays(example_tile)
+            lon_vals, lat_vals, dx, dy = geometry
+            skill_weights, temperature_bias = regional_learning(
+                learning_state,
+                float(np.mean(lat_vals)),
+                float(np.mean(lon_vals)),
+                int(hour),
+                reference_time,
+            )
             components, channels = components_for_hour(
-                contributors, skill_weights
+                contributors, skill_weights, temperature_bias
             )
             if not components:
                 continue
-            geometry = geometry_arrays(next(
-                document[hour] for document in documents.values() if hour in document
-            ))
-            lon_vals, lat_vals, dx, dy = geometry
             hour_entries.append((hour, weather.build_binary_tile_bytes(
                 lon_vals, lat_vals, dx, dy, components
             )))
@@ -169,11 +200,11 @@ def main():
     parser.add_argument("--reference-time", required=True)
     parser.add_argument("--weights")
     args = parser.parse_args()
-    skill_weights = {}
+    learning_state = {}
     if args.weights and os.path.exists(args.weights):
         with open(args.weights) as file:
-            skill_weights = json.load(file).get("weights", {})
-    assemble(args.models_dir, args.reference_time, skill_weights)
+            learning_state = json.load(file)
+    assemble(args.models_dir, args.reference_time, learning_state)
 
 
 if __name__ == "__main__":

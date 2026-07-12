@@ -34,13 +34,28 @@ class AssembleModelPacksTests(unittest.TestCase):
                     "fields": ["temperature"],
                 }))
 
-            assembler.assemble(root, "2026-07-12T12:00:00")
+            learning_state = {
+                "weights": {"gfs": 0.5, "ifs": 0.5},
+                "regions": {
+                    "-10_+000": {
+                        "lead_buckets": {
+                            "0-24": {"weights": {"gfs": 0.1, "ifs": 0.9}}
+                        },
+                        "temperature_bias": {
+                            "day": {"value": 1.0, "samples": 3}
+                        },
+                    }
+                },
+            }
+            assembler.assemble(
+                root, "2026-07-12T12:00:00", learning_state
+            )
 
             manifest = json.loads((root / "manifest.json").read_text())
             self.assertIn("consensus", manifest["models"])
             consensus = packed.read_pack(root / "consensus" / "N0_E0.gpack")
             values = consensus["0"][4][0]
-            self.assertTrue(np.allclose(values, 280.0, atol=0.01))
+            self.assertTrue(np.allclose(values, 285.0, atol=0.01))
 
 
 if __name__ == "__main__":

@@ -48,8 +48,16 @@ def normalize(rows):
         observations.append({
             "icaoId": station,
             "obsTime": observed_at,
+            "latitude": latitude,
+            "longitude": longitude,
             "temp": number(first(row, "temp_c", "temp")),
+            "dewpoint": number(first(row, "dewpoint_c", "dewp")),
             "wspd": number(first(row, "wind_speed_kt", "wspd")),
+            "pressure_hpa": number(first(
+                row, "sea_level_pressure_mb", "pressure_hpa", "mslp"
+            )),
+            "altimeter_in_hg": number(first(row, "altim_in_hg", "altim")),
+            "precipitation_in": number(first(row, "precip_in", "pcp")),
         })
     return observations, sorted(stations.values(), key=lambda item: item["icao"])
 
