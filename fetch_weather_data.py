@@ -323,6 +323,24 @@ MODEL_FIELD_CHANNELS = {
     "snowfall": 9,
     "visibility": 10,
     "condition_code": 11,
+    "precipitation_probability": 12,
+}
+
+MODEL_FAMILIES = {
+    "gfs": "noaa",
+    "aigfs": "noaa",
+    "ifs": "ecmwf",
+    "aifs": "ecmwf",
+    "icon": "dwd",
+}
+CONSENSUS_CONFIDENCE_CHANNELS = {
+    field: 40 + index for index, field in enumerate(MODEL_FIELD_CHANNELS)
+}
+CONSENSUS_SPREAD_CHANNELS = {
+    field: 60 + index for index, field in enumerate(MODEL_FIELD_CHANNELS)
+}
+CONSENSUS_PARTICIPATION_CHANNELS = {
+    field: 80 + index for index, field in enumerate(MODEL_FIELD_CHANNELS)
 }
 
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
@@ -386,21 +404,31 @@ def overview_tile_key(lat_start, lon_start):
 def precision_for_job(job_type):
     return 3 if job_type in ["snow", "smoke", "dust", "air_quality"] else 1
 
-def prepare_grid_values(values, precision):
-    filled = np.where(np.isnan(values), 0, values)
+def prepare_grid_values(values, precision, preserve_missing=False):
+    filled = values if preserve_missing else np.where(np.isnan(values), 0, values)
     return np.round(filled.astype(np.float32), precision).flatten()
 
 def quantize_int16(values):
-    min_value = float(np.min(values))
-    max_value = float(np.max(values))
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return np.full(values.shape, -32768, dtype="<i2"), 1.0, 0.0
+    valid = values[finite]
+    min_value = float(np.min(valid))
+    max_value = float(np.max(valid))
 
     if min_value == max_value:
-        return np.zeros(values.shape, dtype="<i2"), 1.0, min_value
+        quantized = np.full(values.shape, -32768, dtype="<i2")
+        quantized[finite] = 0
+        return quantized, 1.0, min_value
 
     scale = (max_value - min_value) / (INT16_MAX_VALUE - INT16_MIN_VALUE)
     offset = (max_value + min_value) / 2.0
-    quantized = np.rint((values - offset) / scale)
-    quantized = np.clip(quantized, INT16_MIN_VALUE, INT16_MAX_VALUE).astype("<i2")
+    quantized = np.full(values.shape, -32768, dtype="<i2")
+    quantized[finite] = np.clip(
+        np.rint((values[finite] - offset) / scale),
+        INT16_MIN_VALUE,
+        INT16_MAX_VALUE,
+    ).astype("<i2")
     return quantized, float(scale), float(offset)
 
 def build_binary_tile_bytes(lon_vals, lat_vals, dx, dy, components):
@@ -493,7 +521,9 @@ def read_binary_tile(path):
         quantized = np.frombuffer(
             tile, dtype="<i2", count=value_count, offset=start
         ).astype(np.float32)
-        channels[channel] = (quantized * scale + offset).reshape(height, width)
+        decoded = quantized * scale + offset
+        decoded[quantized == -32768] = np.nan
+        channels[channel] = decoded.reshape(height, width)
     lon_vals = lon0 + np.arange(width, dtype=np.float32) * dx
     lat_vals = lat0 + np.arange(height, dtype=np.float32) * dy
     return lon_vals, lat_vals, dx, dy, channels
@@ -930,7 +960,7 @@ def write_model_provider_hour(model_name, forecast_hour, fields):
                     channel,
                     prepare_grid_values(values, 3 if field_name in {
                         "humidity", "precipitation", "snowfall"
-                    } else 1),
+                    } else 1, preserve_missing=True),
                 ))
             if not components:
                 continue
@@ -1006,6 +1036,90 @@ def compact_multi_forecast_tiles():
                 os.path.join(output_dir, f"{tile}.gpack"), day_entries
             )
 
+def _family_balanced_weights(model_names):
+    family_counts = {}
+    for model_name in model_names:
+        family = MODEL_FAMILIES[model_name]
+        family_counts[family] = family_counts.get(family, 0) + 1
+    return np.array([
+        1.0 / family_counts[MODEL_FAMILIES[model_name]]
+        for model_name in model_names
+    ], dtype=np.float32)
+
+def _weighted_median(stack, weights):
+    order = np.argsort(np.where(np.isfinite(stack), stack, np.inf), axis=0)
+    sorted_values = np.take_along_axis(stack, order, axis=0)
+    broadcast_weights = np.broadcast_to(
+        weights.reshape((-1,) + (1,) * (stack.ndim - 1)), stack.shape
+    )
+    sorted_weights = np.take_along_axis(broadcast_weights, order, axis=0)
+    sorted_weights = np.where(np.isfinite(sorted_values), sorted_weights, 0)
+    cumulative = np.cumsum(sorted_weights, axis=0)
+    threshold = np.sum(sorted_weights, axis=0) * 0.5
+    median_index = np.argmax(cumulative >= threshold, axis=0)
+    median = np.take_along_axis(
+        sorted_values, np.expand_dims(median_index, axis=0), axis=0
+    )[0]
+    return np.where(threshold > 0, median, np.nan).astype(np.float32)
+
+def _weighted_vote(stack, weights, categories):
+    scores = np.stack([
+        np.sum(
+            np.where(stack == category, weights.reshape((-1, 1, 1)), 0),
+            axis=0,
+        )
+        for category in categories
+    ])
+    # Reverse argmax resolves exact ties toward the more consequential class.
+    reverse_index = np.argmax(scores[::-1], axis=0)
+    return np.asarray(categories)[len(categories) - 1 - reverse_index]
+
+def _condition_consensus(stack, weights):
+    family_for_code = np.zeros(16, dtype=np.int16)
+    for code in (1, 2): family_for_code[code] = 1
+    for code in (3, 4, 5): family_for_code[code] = 2
+    family_for_code[14] = 3
+    for code in (6, 7, 8): family_for_code[code] = 4
+    for code in (9, 10, 11, 12): family_for_code[code] = 5
+    for code in (13, 15): family_for_code[code] = 6
+    rounded = np.clip(np.rint(stack), 0, 15).astype(np.int16)
+    condition_families = family_for_code[rounded]
+    winning_family = _weighted_vote(
+        condition_families, weights, np.arange(7, dtype=np.int16)
+    )
+    result = np.zeros(stack.shape[1:], dtype=np.float32)
+    for family in range(1, 7):
+        candidates = np.where(
+            condition_families == family, rounded, CONDITION_CODES["Unknown"]
+        )
+        family_codes = np.where(family_for_code == family)[0]
+        selected = _weighted_vote(candidates, weights, family_codes)
+        result = np.where(winning_family == family, selected, result)
+    return result.astype(np.float32)
+
+def _consensus_spread(stack):
+    return (np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)).astype(np.float32)
+
+def _confidence_from_spread(field_name, spread, family_count):
+    tolerances = {
+        "temperature": 8.0,
+        "dewpoint": 8.0,
+        "wind_u": 12.0,
+        "wind_v": 12.0,
+        "wind_gust": 15.0,
+        "pressure": 2500.0,
+        "humidity": 0.5,
+        "cloud_cover": 0.7,
+        "precipitation": 8.0,
+        "snowfall": 5.0,
+        "visibility": 15000.0,
+        "condition_code": 4.0,
+        "precipitation_probability": 1.0,
+    }
+    agreement = 1.0 - np.clip(spread / tolerances[field_name], 0, 1)
+    participation = np.clip(family_count / 3.0, 0, 1)
+    return (agreement * participation).astype(np.float32)
+
 def compact_consensus_tiles():
     """Build one robust median/vote forecast from all available models."""
     output_dir = os.path.join(OUTPUT_DIR, "models", "consensus")
@@ -1018,9 +1132,9 @@ def compact_consensus_tiles():
         for filename in os.listdir(source_dir):
             hour_text, tile_filename = filename.split("h_", 1)
             tile = tile_filename.removesuffix(".gtile")
-            indexed.setdefault((tile, int(hour_text)), []).append(
-                os.path.join(source_dir, filename)
-            )
+            indexed.setdefault((tile, int(hour_text)), []).append((
+                model_name, os.path.join(source_dir, filename)
+            ))
 
     hours = set()
     available_channels = set()
@@ -1028,30 +1142,92 @@ def compact_consensus_tiles():
     for (tile, forecast_hour), paths in indexed.items():
         model_channels = []
         geometry = None
-        for path in paths:
+        for model_name, path in paths:
             lon_vals, lat_vals, dx, dy, channels = read_binary_tile(path)
             geometry = (lon_vals, lat_vals, dx, dy)
-            model_channels.append(channels)
+            model_channels.append((model_name, channels))
         if geometry is None:
             continue
 
         components = []
         for field_name, channel in MODEL_FIELD_CHANNELS.items():
-            values = [item[channel] for item in model_channels if channel in item]
+            if field_name == "precipitation_probability":
+                continue
+            contributors = [
+                (model_name, item[channel])
+                for model_name, item in model_channels if channel in item
+            ]
+            values = [value for _, value in contributors]
             if not values:
                 continue
+            model_names = [model_name for model_name, _ in contributors]
+            family_count = len({MODEL_FAMILIES[name] for name in model_names})
+            if family_count < 2:
+                continue
             stack = np.stack(values)
+            weights = _family_balanced_weights(model_names)
             if field_name == "condition_code":
-                rounded = np.rint(stack).astype(np.int16)
-                counts = np.stack([
-                    np.sum(rounded == code, axis=0) for code in range(16)
-                ])
-                if len(values) > 1:
-                    counts[CONDITION_CODES["Unknown"]] = 0
-                consensus = np.argmax(counts, axis=0).astype(np.float32)
+                consensus = _condition_consensus(stack, weights)
+                spread = np.max(stack, axis=0) - np.min(stack, axis=0)
+            elif field_name == "precipitation":
+                wet = np.where(np.isfinite(stack), stack >= 0.05, False)
+                weighted = weights.reshape((-1, 1, 1))
+                available_weight = np.sum(
+                    np.where(np.isfinite(stack), weighted, 0), axis=0
+                )
+                wet_probability = np.divide(
+                    np.sum(np.where(wet, weighted, 0), axis=0),
+                    available_weight,
+                    out=np.zeros(stack.shape[1:], dtype=np.float32),
+                    where=available_weight > 0,
+                )
+                wet_stack = np.where(wet, stack, np.nan)
+                wet_amount = _weighted_median(wet_stack, weights)
+                consensus = np.where(
+                    wet_probability >= 0.5,
+                    np.nan_to_num(wet_amount, nan=0.0),
+                    0.0,
+                ).astype(np.float32)
+                spread = _consensus_spread(stack)
+                probability_channel = MODEL_FIELD_CHANNELS[
+                    "precipitation_probability"
+                ]
+                components.append((
+                    probability_channel,
+                    prepare_grid_values(
+                        wet_probability, 3, preserve_missing=True
+                    ),
+                ))
+                available_channels.add(probability_channel)
             else:
-                consensus = np.median(stack, axis=0).astype(np.float32)
-            components.append((channel, prepare_grid_values(consensus, 3)))
+                consensus = _weighted_median(stack, weights)
+                spread = _consensus_spread(stack)
+            components.append((
+                channel,
+                prepare_grid_values(consensus, 3, preserve_missing=True),
+            ))
+            participation = np.full(
+                consensus.shape, family_count, dtype=np.float32
+            )
+            confidence = _confidence_from_spread(
+                field_name, spread, family_count
+            )
+            components.extend([
+                (
+                    CONSENSUS_CONFIDENCE_CHANNELS[field_name],
+                    prepare_grid_values(confidence, 3, preserve_missing=True),
+                ),
+                (
+                    CONSENSUS_SPREAD_CHANNELS[field_name],
+                    prepare_grid_values(spread, 3, preserve_missing=True),
+                ),
+                (
+                    CONSENSUS_PARTICIPATION_CHANNELS[field_name],
+                    prepare_grid_values(
+                        participation, 0, preserve_missing=True
+                    ),
+                ),
+            ])
             available_channels.add(channel)
         if not components:
             continue
@@ -1136,6 +1312,13 @@ def compact_model_provider_tiles(reference_time):
                 for field_name, channel in MODEL_FIELD_CHANNELS.items()
                 if channel in consensus_channels
             ],
+            "quality_channels": {
+                "confidence": CONSENSUS_CONFIDENCE_CHANNELS,
+                "spread": CONSENSUS_SPREAD_CHANNELS,
+                "participating_families": CONSENSUS_PARTICIPATION_CHANNELS,
+            },
+            "model_families": MODEL_FAMILIES,
+            "minimum_independent_families": 2,
         }
     with open(os.path.join(output_root, "manifest.json"), "w") as file:
         json.dump(manifest, file, indent=2)
