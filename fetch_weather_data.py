@@ -2142,7 +2142,7 @@ if __name__ == "__main__":
     ACTIVE_MODEL_PROVIDER = args.model_provider
     SKIP_MODEL_PROVIDERS = args.skip_model_providers
 
-    if args.type == "all" or args.model_provider:
+    if args.type == "all" or args.model_provider or args.skip_model_providers:
         print("--- Cleaning Output Directory ---")
         clean_output_directory()
 

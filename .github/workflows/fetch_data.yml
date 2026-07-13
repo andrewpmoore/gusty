@@ -28,6 +28,22 @@ env:
 
 jobs:
   layers:
+    strategy:
+      fail-fast: false
+      matrix:
+        layer:
+          - humidity
+          - clouds
+          - visibility
+          - pressure
+          - waves
+          - smoke
+          - air_quality
+          - dust
+          - snow
+          - cape
+          - storm_potential
+          - storm_motion
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,12 +55,12 @@ jobs:
         with:
           python-version: '3.10'
       - run: pip install requests xarray cfgrib numpy scipy argparse boto3
-      - name: Generate non-radar map layers
-        run: python fetch_weather_data.py --type all --skip-model-providers
-      - name: Upload layer artifact to R2
+      - name: Generate ${{ matrix.layer }} map layer
+        run: python fetch_weather_data.py --type '${{ matrix.layer }}' --skip-model-providers
+      - name: Upload ${{ matrix.layer }} layer artifact to R2
         run: |
-          tar --exclude='models' -C public/data -czf layers.tar.gz .
-          aws s3 cp layers.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers.tar.gz" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          tar --exclude='models' -C public/data -czf layer.tar.gz .
+          aws s3 cp layer.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers/${{ matrix.layer }}.tar.gz" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
   provider:
     strategy:
@@ -72,8 +88,13 @@ jobs:
           jq -r '.ref_time' public/data/models/manifest.json > public/data/models/reference_time.txt
       - name: Upload provider artifact directly to R2
         run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           tar -C public/data/models -czf provider.tar.gz '${{ matrix.provider }}' '${{ matrix.provider }}.json' reference_time.txt
-          aws s3 cp provider.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/providers/${{ matrix.provider }}.tar.gz" --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp provider.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/providers/${{ matrix.provider }}.tar.gz" --endpoint-url "$endpoint"
+          if [ '${{ matrix.provider }}' = 'gfs' ]; then
+            tar --exclude='models' -C public/data -czf temperature-layer.tar.gz .
+            aws s3 cp temperature-layer.tar.gz "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers/temp.tar.gz" --endpoint-url "$endpoint"
+          fi
 
   assemble:
     needs: [layers, provider]
@@ -89,9 +110,14 @@ jobs:
       - name: Download layer and provider artifacts
         run: |
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          mkdir -p public/data/models provider_archives
-          aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers.tar.gz" layers.tar.gz --endpoint-url "$endpoint"
-          tar -C public/data -xzf layers.tar.gz
+          mkdir -p public/data/models provider_archives layer_archives layer_extract
+          for layer in temp humidity clouds visibility pressure waves smoke air_quality dust snow cape storm_potential storm_motion; do
+            aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers/${layer}.tar.gz" "layer_archives/${layer}.tar.gz" --endpoint-url "$endpoint"
+            mkdir -p "layer_extract/${layer}"
+            tar -C "layer_extract/${layer}" -xzf "layer_archives/${layer}.tar.gz"
+            cp -R "layer_extract/${layer}/." public/data/
+          done
+          jq -s 'reduce .[] as $document ({}; . * $document)' layer_extract/*/manifest_update.json > public/data/manifest_update.json
           for provider in gfs ifs aifs aigfs icon; do
             if aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/providers/${provider}.tar.gz" "provider_archives/${provider}.tar.gz" --endpoint-url "$endpoint"; then
               tar -C public/data/models -xzf "provider_archives/${provider}.tar.gz"
