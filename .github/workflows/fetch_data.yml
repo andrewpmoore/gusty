@@ -32,6 +32,8 @@ jobs:
       fail-fast: false
       matrix:
         layer:
+          - wind
+          - gusts
           - humidity
           - clouds
           - visibility
@@ -111,7 +113,7 @@ jobs:
         run: |
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           mkdir -p public/data/models provider_archives layer_archives layer_extract
-          for layer in temp humidity clouds visibility pressure waves smoke air_quality dust snow cape storm_potential storm_motion; do
+          for layer in temp wind gusts humidity clouds visibility pressure waves smoke air_quality dust snow cape storm_potential storm_motion; do
             aws s3 cp "s3://${R2_BUCKET}/staging/${GITHUB_RUN_ID}/layers/${layer}.tar.gz" "layer_archives/${layer}.tar.gz" --endpoint-url "$endpoint"
             mkdir -p "layer_extract/${layer}"
             tar -C "layer_extract/${layer}" -xzf "layer_archives/${layer}.tar.gz"
