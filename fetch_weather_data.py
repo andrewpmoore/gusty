@@ -1453,6 +1453,8 @@ def generate_tiles_from_dataset(ds, forecast_hour, job_type, config, min_grid=No
         if overview_tile:
             entries = entries + [(overview_tile_key(pack_lat_start, pack_lon_start), overview_tile)]
         write_tile_pack(pack_path, entries)
+        for _, tile_path, _, _ in pack_tiles:
+            os.remove(tile_path)
         pack_count += 1
 
     return ref_time_iso, count, pack_count

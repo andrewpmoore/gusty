@@ -1,6 +1,9 @@
 name: Hourly Consensus Verification
 
 on:
+  workflow_run:
+    workflows: ['Fetch Weather Data']
+    types: [completed]
   schedule:
     - cron: '12 * * * *'
   workflow_dispatch:
@@ -21,6 +24,7 @@ env:
 
 jobs:
   forecast:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       available: ${{ steps.pointer.outputs.available }}
@@ -44,6 +48,7 @@ jobs:
           retention-days: 1
 
   observations:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
