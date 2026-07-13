@@ -31,6 +31,18 @@
       "Expiration": {"Days": 7}
     },
     {
+      "ID": "expire-tide-runs-7-days",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "tides/runs/"},
+      "Expiration": {"Days": 7}
+    },
+    {
+      "ID": "expire-scene-runs-30-days",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "scenes/runs/"},
+      "Expiration": {"Days": 30}
+    },
+    {
       "ID": "abort-incomplete-uploads-7-days",
       "Status": "Enabled",
       "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}

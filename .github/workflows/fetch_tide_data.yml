@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'fetch_tides.py'
+      - 'publish_r2.py'
       - 'tides/**'
       - '.github/workflows/fetch_tide_data.yml'
   schedule:
@@ -13,11 +14,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: gusty-data-deploy
-  cancel-in-progress: false
+  group: gusty-tide-build
+  cancel-in-progress: true
+
+env:
+  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
   update-tides:
@@ -28,7 +32,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -55,37 +59,12 @@ jobs:
           TIDES_INCLUDE_NON_COMMERCIAL: 'true'
           TIDES_INCLUDE_ALL_QUALITY: 'true'
 
-      - name: Deploy Tide Data
+      - name: Publish versioned tide data to R2
         env:
-          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_SECRET }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" latest_data || true
-          rm -rf latest_data/.git
-
-          mkdir deploy_staging
-          cd deploy_staging
-          git init
-          git branch -M main
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [ -d "../latest_data" ]; then
-            cp -a ../latest_data/. .
-          else
-            echo "Init" > init.txt
-          fi
-
-          rm -rf tides
-          cp -a ../public/data/tides ./tides
-          git add .
-          git commit --allow-empty -m "Latest Tide Data: $(date -u)"
-
-          for attempt in 1 2 3; do
-            if git push "https://x-access-token:${DATA_REPO_TOKEN}@github.com/andrewpmoore/gusty-data.git" main --force; then
-              exit 0
-            fi
-            if [ "$attempt" = "3" ]; then
-              exit 1
-            fi
-            sleep 10
-          done
+          pip install boto3
+          python publish_r2.py --source public/data/tides --dataset tides \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"

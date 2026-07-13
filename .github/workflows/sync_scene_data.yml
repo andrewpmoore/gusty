@@ -1,0 +1,46 @@
+name: Sync Scene Data to R2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - sync_scenes.py
+      - publish_r2.py
+      - .github/workflows/sync_scene_data.yml
+  schedule:
+    - cron: '27 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gusty-scene-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install boto3
+      - name: Download and validate scene bundle
+        run: |
+          run="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python sync_scenes.py \
+            --source-base 'https://andrewpmoore.github.io/gusty_scenes/scenes' \
+            --public-base "https://weather-data.gustyweather.com/scenes/runs/${run}" \
+            --output scene_payload
+      - name: Publish versioned scene data to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python publish_r2.py --source scene_payload --dataset scenes \
+            --run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --bucket "$R2_BUCKET"
