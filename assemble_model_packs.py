@@ -61,7 +61,15 @@ def components_for_hour(contributors, skill_weights=None, temperature_bias=0.0):
         else:
             consensus = weather._weighted_median(stack, weights)
         if field_name == "temperature" and temperature_bias:
-            consensus = consensus + temperature_bias
+            corrected = consensus + temperature_bias
+            finite = np.isfinite(stack)
+            lower = np.min(np.where(finite, stack, np.inf), axis=0)
+            upper = np.max(np.where(finite, stack, -np.inf), axis=0)
+            consensus = np.where(
+                np.isfinite(consensus),
+                np.minimum(np.maximum(corrected, lower), upper),
+                np.nan,
+            )
         components.append((
             channel,
             weather.prepare_grid_values(consensus, 3, preserve_missing=True),

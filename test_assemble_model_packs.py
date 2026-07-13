@@ -11,7 +11,7 @@ import validate_consensus as packed
 
 
 class AssembleModelPacksTests(unittest.TestCase):
-    def test_assembles_two_independent_families(self):
+    def test_bias_corrected_blend_stays_inside_model_envelope(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             lon = np.array([0.0, 1.0], dtype=np.float32)
@@ -55,7 +55,7 @@ class AssembleModelPacksTests(unittest.TestCase):
             self.assertIn("consensus", manifest["models"])
             consensus = packed.read_pack(root / "consensus" / "N0_E0.gpack")
             values = consensus["0"][4][0]
-            self.assertTrue(np.allclose(values, 285.0, atol=0.01))
+            self.assertTrue(np.allclose(values, 284.0, atol=0.01))
 
     def test_adds_icon_temperature_to_map_tiles_and_overview(self):
         with tempfile.TemporaryDirectory() as temporary:
