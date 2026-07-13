@@ -133,8 +133,14 @@ jobs:
         with:
           name: metar-ground-truth
       - name: Restore previous weights
-        continue-on-error: true
-        run: aws s3 cp "s3://${R2_BUCKET}/state/weights.json" previous-weights.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          if aws s3api head-object --bucket "$R2_BUCKET" --key state/weights.json --endpoint-url "$endpoint" >/dev/null 2>&1; then
+            aws s3 cp "s3://${R2_BUCKET}/state/weights.json" previous-weights.json --endpoint-url "$endpoint"
+          else
+            echo '{}' > previous-weights.json
+            echo "No previous learning state exists; starting with default weights."
+          fi
       - name: Update EMA weights
         run: |
           provider_args=()
