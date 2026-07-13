@@ -415,6 +415,12 @@ def prepare_grid_values(values, precision, preserve_missing=False):
     filled = values if preserve_missing else np.where(np.isnan(values), 0, values)
     return np.round(filled.astype(np.float32), precision).flatten()
 
+def sanitize_temperature_kelvin(values):
+    """Keep plausible atmospheric temperatures and preserve missing coverage."""
+    return values.where(
+        np.isfinite(values) & (values >= 180.0) & (values <= 340.0)
+    )
+
 def quantize_int16(values):
     finite = np.isfinite(values)
     if not np.any(finite):
@@ -1011,23 +1017,34 @@ def compact_multi_forecast_tiles():
                     temperature = channels.get(MODEL_FIELD_CHANNELS["temperature"])
                     if temperature is None:
                         continue
+                    temperature = np.where(
+                        np.isfinite(temperature) &
+                        (temperature >= 180.0) &
+                        (temperature <= 340.0),
+                        temperature,
+                        np.nan,
+                    )
                     geometry = (lon_vals, lat_vals, dx, dy)
                     daily_high = (
                         temperature.copy() if daily_high is None
-                        else np.maximum(daily_high, temperature)
+                        else np.fmax(daily_high, temperature)
                     )
                     daily_low = (
                         temperature.copy() if daily_low is None
-                        else np.minimum(daily_low, temperature)
+                        else np.fmin(daily_low, temperature)
                     )
                 if daily_high is not None:
                     components.append((
                         MULTI_FORECAST_HIGH_CHANNELS[model_name],
-                        prepare_grid_values(daily_high, 1),
+                        prepare_grid_values(
+                            daily_high, 1, preserve_missing=True
+                        ),
                     ))
                     components.append((
                         MULTI_FORECAST_LOW_CHANNELS[model_name],
-                        prepare_grid_values(daily_low, 1),
+                        prepare_grid_values(
+                            daily_low, 1, preserve_missing=True
+                        ),
                     ))
             if geometry is None or not components:
                 continue
@@ -1700,7 +1717,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             raise ValueError("GFS 2 metre temperature field not found")
         gfs_ds = gfs_temp.to_dataset(name="temperature")
         gfs_ds = normalize_dataset_coordinates(gfs_ds)
-        gfs_temp = first_data_array(gfs_ds)  # Keep in Kelvin
+        gfs_temp = sanitize_temperature_kelvin(
+            first_data_array(gfs_ds)
+        )  # Keep in Kelvin
     except Exception as e:
         print(f"      ⚠️ GFS open error: {e}")
         return None, None, None, None
@@ -1759,7 +1778,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = xr.open_dataset(ifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
-            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            temp_aligned = sanitize_temperature_kelvin(
+                temp.interp_like(gfs_temp, method='linear')
+            )
             models_temps["ifs"] = temp_aligned.load()
             provider_fields["ifs"] = extract_provider_fields(
                 "ifs", ifs_path, gfs_temp, models_temps["ifs"]
@@ -1776,7 +1797,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = xr.open_dataset(aifs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
-            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            temp_aligned = sanitize_temperature_kelvin(
+                temp.interp_like(gfs_temp, method='linear')
+            )
             models_temps["aifs"] = temp_aligned.load()
             provider_fields["aifs"] = extract_provider_fields(
                 "aifs", aifs_path, gfs_temp, models_temps["aifs"]
@@ -1793,7 +1816,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = xr.open_dataset(aigfs_path, engine='cfgrib', filter_by_keys={'typeOfLevel': 'heightAboveGround', 'level': 2.0})
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
-            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            temp_aligned = sanitize_temperature_kelvin(
+                temp.interp_like(gfs_temp, method='linear')
+            )
             models_temps["aigfs"] = temp_aligned.load()
             provider_fields["aigfs"] = extract_provider_fields(
                 "aigfs", aigfs_path, gfs_temp, models_temps["aigfs"]
@@ -1810,7 +1835,9 @@ def process_multi_model_variance(date_str, run_hour, forecast_hour, gfs_grib_pat
             ds = xr.open_dataset(icon_path, engine='cfgrib')
             ds = normalize_dataset_coordinates(ds)
             temp = first_data_array(ds)  # Keep in Kelvin
-            temp_aligned = temp.interp_like(gfs_temp, method='linear')
+            temp_aligned = sanitize_temperature_kelvin(
+                temp.interp_like(gfs_temp, method='linear')
+            )
             models_temps["icon"] = temp_aligned.load()
             provider_fields["icon"] = extract_provider_fields(
                 "icon", icon_path, gfs_temp, models_temps["icon"]

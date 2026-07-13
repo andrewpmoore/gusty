@@ -19,6 +19,24 @@ class ConsensusTests(unittest.TestCase):
         self.assertAlmostEqual(float(decoded[0]), 1.0, places=3)
         self.assertAlmostEqual(float(decoded[2]), 3.0, places=3)
 
+    def test_temperature_sanitizer_rejects_zero_kelvin(self):
+        values = weather.xr.DataArray(
+            np.array([[0.0, 273.15, 400.0]], dtype=np.float32)
+        )
+        sanitized = weather.sanitize_temperature_kelvin(values).values
+        self.assertTrue(np.isnan(sanitized[0, 0]))
+        self.assertAlmostEqual(float(sanitized[0, 1]), 273.15, places=2)
+        self.assertTrue(np.isnan(sanitized[0, 2]))
+
+    def test_daily_temperature_missing_values_remain_missing(self):
+        values = weather.prepare_grid_values(
+            np.array([[np.nan, 280.0]], dtype=np.float32),
+            1,
+            preserve_missing=True,
+        )
+        packed, _, _ = weather.quantize_int16(values)
+        self.assertEqual(int(packed[0]), weather.MISSING_VALUE)
+
     def test_related_models_share_one_family_vote(self):
         names = ["gfs", "aigfs", "ifs", "icon"]
         weights = weather._family_balanced_weights(names)
