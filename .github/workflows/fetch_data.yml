@@ -101,7 +101,12 @@ jobs:
         run: |
           test "$(find public/data/models -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 2
           reference_time="$(head -1 public/data/models/reference_time.txt)"
-          aws s3 cp "s3://${R2_BUCKET}/state/weights.json" weights.json --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" || true
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          if aws s3api head-object --bucket "$R2_BUCKET" --key state/weights.json --endpoint-url "$endpoint" >/dev/null 2>&1; then
+            aws s3 cp "s3://${R2_BUCKET}/state/weights.json" weights.json --endpoint-url "$endpoint"
+          else
+            echo "No learned weights exist yet; assembling with cold-start defaults."
+          fi
           python assemble_model_packs.py --models-dir public/data/models --reference-time "$reference_time" --weights weights.json
           jq -e '.models.consensus' public/data/models/manifest.json
       - name: Publish compressed versioned forecast

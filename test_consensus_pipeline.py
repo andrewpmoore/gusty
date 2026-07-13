@@ -8,6 +8,11 @@ import consensus_pipeline as pipeline
 
 
 class ConsensusPipelineTests(unittest.TestCase):
+    def test_parse_time_accepts_nanosecond_model_timestamp(self):
+        parsed = pipeline.parse_time("2026-07-12T18:00:00.123456789")
+        self.assertEqual(parsed.microsecond, 123456)
+        self.assertEqual(parsed.tzinfo, dt.timezone.utc)
+
     def test_ema_rewards_lower_error(self):
         result = pipeline.update_scores(
             {}, {"gfs": [0.25], "icon": [2.0]}, alpha=1.0
