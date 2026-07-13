@@ -108,6 +108,7 @@ def assemble(root, reference_time, learning_state=None):
             for name in providers if (root / name / tile_name).exists()
         }
         hour_entries = []
+        consensus_hour_channels = {}
         all_hours = sorted({hour for document in documents.values() for hour in document})
         for hour in all_hours:
             contributors = [
@@ -131,6 +132,11 @@ def assemble(root, reference_time, learning_state=None):
             )
             if not components:
                 continue
+            shape = next(iter(example_tile[4].values())).shape
+            consensus_hour_channels[int(hour)] = {
+                channel: values.reshape(shape)
+                for channel, values in components
+            }
             hour_entries.append((hour, weather.build_binary_tile_bytes(
                 lon_vals, lat_vals, dx, dy, components
             )))
@@ -141,24 +147,27 @@ def assemble(root, reference_time, learning_state=None):
 
         day_entries = []
         for day in range(15):
-            components = []
             geometry = None
+            model_hour_channels = {}
             for name in weather.MULTI_FORECAST_MODELS:
                 document = documents.get(name, {})
-                temperatures = []
+                hourly_channels = []
                 for hour, tile in document.items():
                     if int(hour) // 24 != day:
                         continue
-                    temperature = tile[4].get(weather.MODEL_FIELD_CHANNELS["temperature"])
-                    if temperature is not None:
-                        temperatures.append(temperature)
-                        geometry = geometry_arrays(tile)
-                if temperatures:
-                    stack = np.stack(temperatures)
-                    components.extend([
-                        (weather.MULTI_FORECAST_HIGH_CHANNELS[name], weather.prepare_grid_values(np.nanmax(stack, axis=0), 1, preserve_missing=True)),
-                        (weather.MULTI_FORECAST_LOW_CHANNELS[name], weather.prepare_grid_values(np.nanmin(stack, axis=0), 1, preserve_missing=True)),
-                    ])
+                    hourly_channels.append(tile[4])
+                    geometry = geometry_arrays(tile)
+                if hourly_channels:
+                    model_hour_channels[name] = hourly_channels
+            blend_hours = [
+                channels for hour, channels in consensus_hour_channels.items()
+                if int(hour) // 24 == day
+            ]
+            if blend_hours:
+                model_hour_channels["blend"] = blend_hours
+            components = weather.multi_forecast_daily_components(
+                model_hour_channels
+            )
             if components and geometry:
                 lon_vals, lat_vals, dx, dy = geometry
                 day_entries.append((str(day), weather.build_binary_tile_bytes(

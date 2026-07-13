@@ -37,6 +37,38 @@ class ConsensusTests(unittest.TestCase):
         packed, _, _ = weather.quantize_int16(values)
         self.assertEqual(int(packed[0]), weather.MISSING_VALUE)
 
+    def test_multi_forecast_summary_includes_gfs_and_other_fields(self):
+        channels = {
+            weather.MODEL_FIELD_CHANNELS["temperature"]: np.array(
+                [[280.0]], dtype=np.float32
+            ),
+            weather.MODEL_FIELD_CHANNELS["wind_u"]: np.array(
+                [[3.0]], dtype=np.float32
+            ),
+            weather.MODEL_FIELD_CHANNELS["wind_v"]: np.array(
+                [[4.0]], dtype=np.float32
+            ),
+            weather.MODEL_FIELD_CHANNELS["pressure"]: np.array(
+                [[101300.0]], dtype=np.float32
+            ),
+            weather.MODEL_FIELD_CHANNELS["humidity"]: np.array(
+                [[0.75]], dtype=np.float32
+            ),
+        }
+        components = dict(weather.multi_forecast_daily_components({
+            "gfs": [channels],
+            "blend": [channels],
+        }))
+        field_channels = weather.MULTI_FORECAST_FIELD_CHANNELS
+        self.assertIn(field_channels["temperature"]["high"]["gfs"], components)
+        wind_channel = field_channels["wind_speed"]["high"]["gfs"]
+        self.assertAlmostEqual(float(components[wind_channel][0]), 5.0)
+        self.assertIn(field_channels["pressure"]["low"]["gfs"], components)
+        self.assertIn(field_channels["humidity"]["high"]["gfs"], components)
+        blend_channels = weather.MULTI_FORECAST_BLEND_CHANNELS
+        self.assertIn(blend_channels["temperature"]["high"], components)
+        self.assertIn(blend_channels["wind_speed"]["low"], components)
+
     def test_related_models_share_one_family_vote(self):
         names = ["gfs", "aigfs", "ifs", "icon"]
         weights = weather._family_balanced_weights(names)

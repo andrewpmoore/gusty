@@ -348,13 +348,38 @@ CONSENSUS_QUALITY_FIELDS = {"temperature", "precipitation", "condition_code"}
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
 ACTIVE_MODEL_PROVIDER = None
 SKIP_MODEL_PROVIDERS = False
-MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon")
-MULTI_FORECAST_HIGH_CHANNELS = {
-    model: 20 + index for index, model in enumerate(MULTI_FORECAST_MODELS)
+MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon", "gfs")
+MULTI_FORECAST_FIELD_CHANNELS = {
+    "temperature": {
+        "high": {"ifs": 20, "aifs": 21, "aigfs": 22, "icon": 23, "gfs": 28},
+        "low": {"ifs": 24, "aifs": 25, "aigfs": 26, "icon": 27, "gfs": 29},
+    },
+    "wind_speed": {
+        "high": {model: 100 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+        "low": {model: 105 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+    },
+    "wind_gust": {
+        "high": {model: 110 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+        "low": {model: 115 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+    },
+    "pressure": {
+        "high": {model: 120 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+        "low": {model: 125 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+    },
+    "humidity": {
+        "high": {model: 130 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+        "low": {model: 135 + index for index, model in enumerate(MULTI_FORECAST_MODELS)},
+    },
 }
-MULTI_FORECAST_LOW_CHANNELS = {
-    model: 24 + index for index, model in enumerate(MULTI_FORECAST_MODELS)
+MULTI_FORECAST_BLEND_CHANNELS = {
+    "temperature": {"high": 30, "low": 31},
+    "wind_speed": {"high": 140, "low": 141},
+    "wind_gust": {"high": 142, "low": 143},
+    "pressure": {"high": 144, "low": 145},
+    "humidity": {"high": 146, "low": 147},
 }
+MULTI_FORECAST_HIGH_CHANNELS = MULTI_FORECAST_FIELD_CHANNELS["temperature"]["high"]
+MULTI_FORECAST_LOW_CHANNELS = MULTI_FORECAST_FIELD_CHANNELS["temperature"]["low"]
 MODEL_WORK_DIR = os.path.join(OUTPUT_DIR, ".model_provider_work")
 MODEL_PREVIOUS_ACCUMULATIONS = {}
 CONSENSUS_WEIGHTS_FILE = os.environ.get(
@@ -420,6 +445,101 @@ def sanitize_temperature_kelvin(values):
     return values.where(
         np.isfinite(values) & (values >= 180.0) & (values <= 340.0)
     )
+
+def multi_forecast_field_values(channels, field_name):
+    """Return a physically plausible daily-summary field from model channels."""
+    if field_name == "wind_speed":
+        u = channels.get(MODEL_FIELD_CHANNELS["wind_u"])
+        v = channels.get(MODEL_FIELD_CHANNELS["wind_v"])
+        if u is None or v is None:
+            return None
+        values = np.sqrt(np.square(u) + np.square(v))
+        valid = np.isfinite(values) & (values >= 0.0) & (values <= 150.0)
+    else:
+        source_name = {
+            "temperature": "temperature",
+            "wind_gust": "wind_gust",
+            "pressure": "pressure",
+            "humidity": "humidity",
+        }[field_name]
+        values = channels.get(MODEL_FIELD_CHANNELS[source_name])
+        if values is None:
+            return None
+        limits = {
+            "temperature": (180.0, 340.0),
+            "wind_gust": (0.0, 200.0),
+            "pressure": (80000.0, 110000.0),
+            "humidity": (0.0, 1.0),
+        }
+        minimum, maximum = limits[field_name]
+        valid = np.isfinite(values) & (values >= minimum) & (values <= maximum)
+    return np.where(valid, values, np.nan).astype(np.float32)
+
+def multi_forecast_daily_components(model_hour_channels):
+    """Build compact per-model daily min/max channels for supported fields."""
+    components = []
+    for model_name in MULTI_FORECAST_MODELS:
+        hourly_channels = model_hour_channels.get(model_name, ())
+        for field_name, channel_map in MULTI_FORECAST_FIELD_CHANNELS.items():
+            samples = [
+                values for channels in hourly_channels
+                if (values := multi_forecast_field_values(channels, field_name))
+                is not None
+            ]
+            if not samples:
+                continue
+            stack = np.stack(samples)
+            finite = np.isfinite(stack)
+            has_value = np.any(finite, axis=0)
+            high = np.max(np.where(finite, stack, -np.inf), axis=0)
+            low = np.min(np.where(finite, stack, np.inf), axis=0)
+            high = np.where(has_value, high, np.nan)
+            low = np.where(has_value, low, np.nan)
+            precision = 3 if field_name == "humidity" else 1
+            components.extend([
+                (
+                    channel_map["high"][model_name],
+                    prepare_grid_values(high, precision, preserve_missing=True),
+                ),
+                (
+                    channel_map["low"][model_name],
+                    prepare_grid_values(low, precision, preserve_missing=True),
+                ),
+            ])
+    blend_hours = model_hour_channels.get("blend", ())
+    for field_name, channel_map in MULTI_FORECAST_BLEND_CHANNELS.items():
+        samples = [
+            values for channels in blend_hours
+            if (values := multi_forecast_field_values(channels, field_name))
+            is not None
+        ]
+        if not samples:
+            continue
+        stack = np.stack(samples)
+        finite = np.isfinite(stack)
+        has_value = np.any(finite, axis=0)
+        high = np.where(
+            has_value,
+            np.max(np.where(finite, stack, -np.inf), axis=0),
+            np.nan,
+        )
+        low = np.where(
+            has_value,
+            np.min(np.where(finite, stack, np.inf), axis=0),
+            np.nan,
+        )
+        precision = 3 if field_name == "humidity" else 1
+        components.extend([
+            (
+                channel_map["high"],
+                prepare_grid_values(high, precision, preserve_missing=True),
+            ),
+            (
+                channel_map["low"],
+                prepare_grid_values(low, precision, preserve_missing=True),
+            ),
+        ])
+    return components
 
 def quantize_int16(values):
     finite = np.isfinite(values)
@@ -1006,46 +1126,18 @@ def compact_multi_forecast_tiles():
     for tile in sorted(tile_names):
         day_entries = []
         for day in range(15):
-            components = []
             geometry = None
+            model_hour_channels = {}
             for model_name in MULTI_FORECAST_MODELS:
                 paths = model_files[model_name].get((tile, day), [])
-                daily_high = None
-                daily_low = None
+                hourly_channels = []
                 for path in paths:
                     lon_vals, lat_vals, dx, dy, channels = read_binary_tile(path)
-                    temperature = channels.get(MODEL_FIELD_CHANNELS["temperature"])
-                    if temperature is None:
-                        continue
-                    temperature = np.where(
-                        np.isfinite(temperature) &
-                        (temperature >= 180.0) &
-                        (temperature <= 340.0),
-                        temperature,
-                        np.nan,
-                    )
                     geometry = (lon_vals, lat_vals, dx, dy)
-                    daily_high = (
-                        temperature.copy() if daily_high is None
-                        else np.fmax(daily_high, temperature)
-                    )
-                    daily_low = (
-                        temperature.copy() if daily_low is None
-                        else np.fmin(daily_low, temperature)
-                    )
-                if daily_high is not None:
-                    components.append((
-                        MULTI_FORECAST_HIGH_CHANNELS[model_name],
-                        prepare_grid_values(
-                            daily_high, 1, preserve_missing=True
-                        ),
-                    ))
-                    components.append((
-                        MULTI_FORECAST_LOW_CHANNELS[model_name],
-                        prepare_grid_values(
-                            daily_low, 1, preserve_missing=True
-                        ),
-                    ))
+                    hourly_channels.append(channels)
+                if hourly_channels:
+                    model_hour_channels[model_name] = hourly_channels
+            components = multi_forecast_daily_components(model_hour_channels)
             if geometry is None or not components:
                 continue
             lon_vals, lat_vals, dx, dy = geometry
