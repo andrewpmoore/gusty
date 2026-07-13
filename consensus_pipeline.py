@@ -15,10 +15,11 @@ import json
 import math
 import os
 import pathlib
-import re
 import tempfile
 import urllib.parse
 import urllib.request
+
+from weather_time import parse_utc
 
 
 SCHEMA_VERSION = 2
@@ -35,13 +36,7 @@ def utc_now():
 
 
 def parse_time(value):
-    text = str(value).strip()
-    # NumPy/xarray timestamps commonly contain nanoseconds; datetime supports 6 digits.
-    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
-    parsed = dt.datetime.fromisoformat(text)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    return parse_utc(value)
 
 
 def atomic_json(path, value):

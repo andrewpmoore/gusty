@@ -1,6 +1,15 @@
 name: Hourly Consensus Verification
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - weather_time.py
+      - consensus_pipeline.py
+      - validate_consensus.py
+      - extract_station_forecasts.py
+      - prepare_metar_data.py
+      - .github/workflows/hourly_consensus.yml
   workflow_run:
     workflows: ['Fetch Weather Data']
     types: [completed]

@@ -11,6 +11,7 @@ import struct
 import numpy as np
 
 import fetch_weather_data as weather
+from weather_time import parse_utc
 
 
 def read_pack(path):
@@ -77,8 +78,7 @@ def sample(tile, latitude, longitude, channel):
 
 
 def parse_time(value):
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    return parse_utc(value)
 
 
 def mean(values):

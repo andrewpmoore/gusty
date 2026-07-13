@@ -3,9 +3,14 @@ import unittest
 import numpy as np
 
 import fetch_weather_data as weather
+import validate_consensus as validation
 
 
 class ConsensusTests(unittest.TestCase):
+    def test_validation_accepts_nanosecond_model_timestamp(self):
+        parsed = validation.parse_time("2026-07-13T06:00:00.123456789")
+        self.assertEqual(parsed.microsecond, 123456)
+
     def test_missing_values_use_reserved_sentinel(self):
         values = np.array([1.0, np.nan, 3.0], dtype=np.float32)
         packed, scale, offset = weather.quantize_int16(values)
