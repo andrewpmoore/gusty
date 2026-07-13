@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 
 import numpy as np
 
@@ -85,6 +86,132 @@ def regional_learning(state, latitude, longitude, forecast_hour, reference_time)
         bias.get("samples", 0)
     ) >= 3 else 0.0
     return weights, bias_value
+
+
+def _resample_channel(tile, lon_vals, lat_vals, channel):
+    values = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+    for y, latitude in enumerate(lat_vals):
+        for x, longitude in enumerate(lon_vals):
+            value = packed.sample(tile, float(latitude), float(longitude), channel)
+            if value is not None:
+                values[y, x] = value
+    return values
+
+
+def _channel_on_geometry(tile, lon_vals, lat_vals, channel):
+    source_lon, source_lat, source_dx, source_dy = geometry_arrays(tile)
+    source = tile[4][channel]
+    if (
+        source.shape == (len(lat_vals), len(lon_vals))
+        and np.allclose(source_lon, lon_vals)
+        and np.allclose(source_lat, lat_vals)
+    ):
+        return source.copy()
+    return _resample_channel(tile, lon_vals, lat_vals, channel)
+
+
+def _copy_channel_into_grid(target, lon_vals, lat_vals, tile, channel):
+    lon0, lat0, dx, dy, channels = tile
+    source = channels[channel]
+    lon1 = lon0 + dx * (source.shape[1] - 1)
+    lat1 = lat0 + dy * (source.shape[0] - 1)
+    target_x = np.where(
+        (lon_vals >= min(lon0, lon1) - 1e-4)
+        & (lon_vals <= max(lon0, lon1) + 1e-4)
+    )[0]
+    target_y = np.where(
+        (lat_vals >= min(lat0, lat1) - 1e-4)
+        & (lat_vals <= max(lat0, lat1) + 1e-4)
+    )[0]
+    if target_x.size == 0 or target_y.size == 0:
+        return
+    source_x = np.rint((lon_vals[target_x] - lon0) / dx).astype(int)
+    source_y = np.rint((lat_vals[target_y] - lat0) / dy).astype(int)
+    source_x = np.clip(source_x, 0, source.shape[1] - 1)
+    source_y = np.clip(source_y, 0, source.shape[0] - 1)
+    target[np.ix_(target_y, target_x)] = source[np.ix_(source_y, source_x)]
+
+
+def add_compact_model_temperature_channels(root):
+    """Inject provider temperatures into existing map packs and overviews."""
+    root = pathlib.Path(root)
+    temperature_dir = root.parent / "temp"
+    if not temperature_dir.is_dir():
+        return
+
+    provider_documents = {}
+
+    def provider_tile(provider, tile_key, hour):
+        cache_key = (provider, tile_key)
+        if cache_key not in provider_documents:
+            path = root / provider / f"{tile_key}.gpack"
+            provider_documents[cache_key] = (
+                packed.read_pack(path) if path.exists() else {}
+            )
+        return provider_documents[cache_key].get(str(hour))
+
+    for pack_path in temperature_dir.glob("temp_*h_*.gpack"):
+        match = re.match(r"temp_(\d+)h_", pack_path.name)
+        if not match:
+            continue
+        hour = int(match.group(1))
+        document = packed.read_pack(pack_path)
+        detailed_keys = [
+            key for key in document if not key.endswith(weather.OVERVIEW_KEY_SUFFIX)
+        ]
+        augmented_tiles = {}
+        output_entries = []
+
+        for tile_key in detailed_keys:
+            tile = document[tile_key]
+            lon_vals, lat_vals, dx, dy = geometry_arrays(tile)
+            components = list(tile[4].items())
+            channels = dict(tile[4])
+            for provider, output_channel in weather.MAP_TEMPERATURE_MODEL_CHANNELS.items():
+                if provider == "gfs" or output_channel in channels:
+                    continue
+                source = provider_tile(provider, tile_key, hour)
+                if source is None or weather.MODEL_FIELD_CHANNELS["temperature"] not in source[4]:
+                    continue
+                values = _channel_on_geometry(
+                    source,
+                    lon_vals,
+                    lat_vals,
+                    weather.MODEL_FIELD_CHANNELS["temperature"],
+                )
+                components.append((output_channel, values))
+                channels[output_channel] = values
+            tile_bytes = weather.build_binary_tile_bytes(
+                lon_vals, lat_vals, dx, dy, components
+            )
+            output_entries.append((tile_key, tile_bytes))
+            augmented_tiles[tile_key] = (
+                float(lon_vals[0]), float(lat_vals[0]), dx, dy, channels
+            )
+
+        for tile_key, tile in document.items():
+            if not tile_key.endswith(weather.OVERVIEW_KEY_SUFFIX):
+                continue
+            lon_vals, lat_vals, dx, dy = geometry_arrays(tile)
+            components = list(tile[4].items())
+            for provider, output_channel in weather.MAP_TEMPERATURE_MODEL_CHANNELS.items():
+                if provider == "gfs" or output_channel in tile[4]:
+                    continue
+                values = np.full(
+                    (len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32
+                )
+                for source in augmented_tiles.values():
+                    if output_channel in source[4]:
+                        _copy_channel_into_grid(
+                            values, lon_vals, lat_vals, source, output_channel
+                        )
+                components.append((output_channel, values))
+            output_entries.append((tile_key, weather.build_binary_tile_bytes(
+                lon_vals, lat_vals, dx, dy, components
+            )))
+
+        if output_entries:
+            weather.write_tile_pack(pack_path, output_entries)
 
 
 def assemble(root, reference_time, learning_state=None):
@@ -193,6 +320,7 @@ def assemble(root, reference_time, learning_state=None):
             "model_families": weather.MODEL_FAMILIES,
             "minimum_independent_families": 2,
         }
+    add_compact_model_temperature_channels(root)
     manifest = {
         "version": 2,
         "ref_time": reference_time,

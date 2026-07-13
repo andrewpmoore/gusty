@@ -57,6 +57,36 @@ class AssembleModelPacksTests(unittest.TestCase):
             values = consensus["0"][4][0]
             self.assertTrue(np.allclose(values, 285.0, atol=0.01))
 
+    def test_adds_icon_temperature_to_map_tiles_and_overview(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "models"
+            icon = root / "icon"
+            temperature = base / "temp"
+            icon.mkdir(parents=True)
+            temperature.mkdir()
+            lon = np.array([0.0, 1.0], dtype=np.float32)
+            lat = np.array([1.0, 0.0], dtype=np.float32)
+            icon_tile = weather.build_binary_tile_bytes(
+                lon, lat, 1.0, -1.0,
+                [(0, np.full(4, 284.0, dtype=np.float32))],
+            )
+            weather.write_tile_pack(icon / "N0_E0.gpack", [("0", icon_tile)])
+            base_tile = weather.build_binary_tile_bytes(
+                lon, lat, 1.0, -1.0,
+                [(0, np.full(4, 280.0, dtype=np.float32))],
+            )
+            weather.write_tile_pack(
+                temperature / "temp_0h_N0_E0.gpack",
+                [("N0_E0", base_tile), ("N0_E0_60", base_tile)],
+            )
+
+            assembler.add_compact_model_temperature_channels(root)
+
+            result = packed.read_pack(temperature / "temp_0h_N0_E0.gpack")
+            self.assertTrue(np.allclose(result["N0_E0"][4][15], 284.0))
+            self.assertTrue(np.allclose(result["N0_E0_60"][4][15], 284.0))
+
 
 if __name__ == "__main__":
     unittest.main()

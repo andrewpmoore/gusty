@@ -346,6 +346,13 @@ CONSENSUS_PARTICIPATION_CHANNELS = {
 CONSENSUS_QUALITY_FIELDS = {"temperature", "precipitation", "condition_code"}
 
 MODEL_PROVIDER_IDS = ("gfs", "ifs", "aifs", "aigfs", "icon")
+MAP_TEMPERATURE_MODEL_CHANNELS = {
+    "gfs": 0,
+    "ifs": 12,
+    "aifs": 13,
+    "aigfs": 14,
+    "icon": 15,
+}
 ACTIVE_MODEL_PROVIDER = None
 SKIP_MODEL_PROVIDERS = False
 MULTI_FORECAST_MODELS = ("ifs", "aifs", "aigfs", "icon", "gfs")
@@ -736,13 +743,9 @@ def make_components(subset, config, job_type, sample_step=1, subset_min=None, su
             # Individual multi-model temperature values.  These channels are
             # kept alongside the aggregate range so clients can show a
             # per-model tooltip without downloading the source GRIB files.
-            model_channels = {
-                "ifs": 12,
-                "aifs": 13,
-                "aigfs": 14,
-                "icon": 15,
-            }
-            for model_name, parameter_number in model_channels.items():
+            for model_name, parameter_number in MAP_TEMPERATURE_MODEL_CHANNELS.items():
+                if model_name == "gfs":
+                    continue
                 model_grid = model_grids.get(model_name) if model_grids else None
                 if model_grid is None:
                     continue
