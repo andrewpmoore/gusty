@@ -56,6 +56,14 @@ class AssembleModelPacksTests(unittest.TestCase):
             consensus = packed.read_pack(root / "consensus" / "N0_E0.gpack")
             values = consensus["0"][4][0]
             self.assertTrue(np.allclose(values, 284.0, atol=0.01))
+            combined = packed.read_pack(root / "multi" / "N0_E0.gpack")
+            temperature = packed.read_pack(
+                root / "multi" / "temperature" / "N0_E0.gpack"
+            )
+            self.assertEqual(
+                set(combined["0"][4]),
+                set(temperature["0"][4]),
+            )
 
     def test_adds_icon_temperature_to_map_tiles_and_overview(self):
         with tempfile.TemporaryDirectory() as temporary:

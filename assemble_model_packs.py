@@ -228,6 +228,12 @@ def assemble(root, reference_time, learning_state=None):
     multi_output = root / "multi"
     output.mkdir(exist_ok=True)
     multi_output.mkdir(exist_ok=True)
+    multi_field_outputs = {
+        field_name: multi_output / field_name
+        for field_name in weather.MULTI_FORECAST_FIELD_CHANNELS
+    }
+    for field_output in multi_field_outputs.values():
+        field_output.mkdir(exist_ok=True)
     providers = [
         name for name in weather.MODEL_PROVIDER_IDS if (root / name).is_dir()
     ]
@@ -281,6 +287,10 @@ def assemble(root, reference_time, learning_state=None):
             weather.write_tile_pack(output / tile_name, hour_entries)
 
         day_entries = []
+        field_day_entries = {
+            field_name: []
+            for field_name in weather.MULTI_FORECAST_FIELD_CHANNELS
+        }
         for day in range(15):
             geometry = None
             model_hour_channels = {}
@@ -310,8 +320,31 @@ def assemble(root, reference_time, learning_state=None):
                 day_entries.append((str(day), weather.build_binary_tile_bytes(
                     lon_vals, lat_vals, dx, dy, components
                 )))
+                for field_name in weather.MULTI_FORECAST_FIELD_CHANNELS:
+                    field_components = (
+                        weather.multi_forecast_components_for_field(
+                            components, field_name
+                        )
+                    )
+                    if field_components:
+                        field_day_entries[field_name].append((
+                            str(day),
+                            weather.build_binary_tile_bytes(
+                                lon_vals,
+                                lat_vals,
+                                dx,
+                                dy,
+                                field_components,
+                            ),
+                        ))
         if day_entries:
             weather.write_tile_pack(multi_output / tile_name, day_entries)
+        for field_name, entries in field_day_entries.items():
+            if entries:
+                weather.write_tile_pack(
+                    multi_field_outputs[field_name] / tile_name,
+                    entries,
+                )
 
     models = {}
     for name in providers:

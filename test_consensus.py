@@ -74,6 +74,26 @@ class ConsensusTests(unittest.TestCase):
         self.assertFalse(weather.has_daily_extrema_coverage([120]))
         self.assertFalse(weather.has_daily_extrema_coverage([30, 36]))
 
+    def test_multi_forecast_field_filter_keeps_only_requested_channels(self):
+        components = [
+            (channel, np.array([float(channel)], dtype=np.float32))
+            for field_name in weather.MULTI_FORECAST_FIELD_CHANNELS
+            for channel in weather.multi_forecast_field_channel_numbers(
+                field_name
+            )
+        ]
+        temperature = weather.multi_forecast_components_for_field(
+            components, "temperature"
+        )
+        temperature_channels = {channel for channel, _ in temperature}
+        self.assertEqual(
+            temperature_channels,
+            weather.multi_forecast_field_channel_numbers("temperature"),
+        )
+        self.assertTrue(temperature_channels.isdisjoint(
+            weather.multi_forecast_field_channel_numbers("wind_speed")
+        ))
+
     def test_related_models_share_one_family_vote(self):
         names = ["gfs", "aigfs", "ifs", "icon"]
         weights = weather._family_balanced_weights(names)

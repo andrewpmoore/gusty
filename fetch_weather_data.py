@@ -558,6 +558,23 @@ def multi_forecast_daily_components(model_hour_channels):
         ])
     return components
 
+def multi_forecast_field_channel_numbers(field_name):
+    """Return every model and blend channel belonging to one summary field."""
+    channels = MULTI_FORECAST_FIELD_CHANNELS[field_name]
+    blend_channels = MULTI_FORECAST_BLEND_CHANNELS[field_name]
+    return {
+        *channels["high"].values(),
+        *channels["low"].values(),
+        *blend_channels.values(),
+    }
+
+def multi_forecast_components_for_field(components, field_name):
+    """Filter combined summary components without changing their encoding."""
+    field_channels = multi_forecast_field_channel_numbers(field_name)
+    return [
+        component for component in components if component[0] in field_channels
+    ]
+
 def quantize_int16(values):
     finite = np.isfinite(values)
     if not np.any(finite):
@@ -1117,9 +1134,15 @@ def write_model_provider_hour(model_name, forecast_hour, fields):
             write_binary_tile(path, lon_vals, lat_vals, dx, dy, components)
 
 def compact_multi_forecast_tiles():
-    """Precompute every model's daily high/low into one request per tile."""
+    """Precompute combined and field-specific daily model summaries."""
     output_dir = os.path.join(OUTPUT_DIR, "models", "multi")
     os.makedirs(output_dir, exist_ok=True)
+    field_output_dirs = {
+        field_name: os.path.join(output_dir, field_name)
+        for field_name in MULTI_FORECAST_FIELD_CHANNELS
+    }
+    for field_output_dir in field_output_dirs.values():
+        os.makedirs(field_output_dir, exist_ok=True)
     model_files = {}
     tile_names = set()
     for model_name in MULTI_FORECAST_MODELS:
@@ -1138,6 +1161,9 @@ def compact_multi_forecast_tiles():
 
     for tile in sorted(tile_names):
         day_entries = []
+        field_day_entries = {
+            field_name: [] for field_name in MULTI_FORECAST_FIELD_CHANNELS
+        }
         for day in range(15):
             geometry = None
             model_hour_channels = {}
@@ -1162,10 +1188,29 @@ def compact_multi_forecast_tiles():
                     lon_vals, lat_vals, dx, dy, components
                 ),
             ))
+            for field_name in MULTI_FORECAST_FIELD_CHANNELS:
+                field_components = multi_forecast_components_for_field(
+                    components, field_name
+                )
+                if field_components:
+                    field_day_entries[field_name].append((
+                        str(day),
+                        build_binary_tile_bytes(
+                            lon_vals, lat_vals, dx, dy, field_components
+                        ),
+                    ))
         if day_entries:
             write_tile_pack(
                 os.path.join(output_dir, f"{tile}.gpack"), day_entries
             )
+        for field_name, entries in field_day_entries.items():
+            if entries:
+                write_tile_pack(
+                    os.path.join(
+                        field_output_dirs[field_name], f"{tile}.gpack"
+                    ),
+                    entries,
+                )
 
 def load_consensus_skill_weights(path=CONSENSUS_WEIGHTS_FILE):
     try:
