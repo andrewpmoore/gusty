@@ -69,6 +69,11 @@ class ConsensusTests(unittest.TestCase):
         self.assertIn(blend_channels["temperature"]["high"], components)
         self.assertIn(blend_channels["wind_speed"]["low"], components)
 
+    def test_daily_extrema_require_broad_time_coverage(self):
+        self.assertTrue(weather.has_daily_extrema_coverage([24, 30, 36, 42]))
+        self.assertFalse(weather.has_daily_extrema_coverage([120]))
+        self.assertFalse(weather.has_daily_extrema_coverage([30, 36]))
+
     def test_related_models_share_one_family_vote(self):
         names = ["gfs", "aigfs", "ifs", "icon"]
         weights = weather._family_balanced_weights(names)

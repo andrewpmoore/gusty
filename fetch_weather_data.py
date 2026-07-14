@@ -482,6 +482,16 @@ def multi_forecast_field_values(channels, field_name):
         valid = np.isfinite(values) & (values >= minimum) & (values <= maximum)
     return np.where(valid, values, np.nan).astype(np.float32)
 
+def has_daily_extrema_coverage(forecast_hours):
+    """Require enough of a UTC day to publish meaningful daily extrema."""
+    hours = sorted({int(hour) % 24 for hour in forecast_hours})
+    return (
+        len(hours) >= 3
+        and hours[0] <= 9
+        and hours[-1] >= 12
+        and hours[-1] - hours[0] >= 12
+    )
+
 def multi_forecast_daily_components(model_hour_channels):
     """Build compact per-model daily min/max channels for supported fields."""
     components = []
@@ -1121,7 +1131,7 @@ def compact_multi_forecast_tiles():
                 tile = tile_filename.removesuffix(".gtile")
                 day = int(hour_text) // 24
                 indexed.setdefault((tile, day), []).append(
-                    os.path.join(source_dir, filename)
+                    (int(hour_text), os.path.join(source_dir, filename))
                 )
                 tile_names.add(tile)
         model_files[model_name] = indexed
@@ -1132,13 +1142,15 @@ def compact_multi_forecast_tiles():
             geometry = None
             model_hour_channels = {}
             for model_name in MULTI_FORECAST_MODELS:
-                paths = model_files[model_name].get((tile, day), [])
+                hour_paths = model_files[model_name].get((tile, day), [])
                 hourly_channels = []
-                for path in paths:
+                for _, path in hour_paths:
                     lon_vals, lat_vals, dx, dy, channels = read_binary_tile(path)
                     geometry = (lon_vals, lat_vals, dx, dy)
                     hourly_channels.append(channels)
-                if hourly_channels:
+                if has_daily_extrema_coverage(
+                    hour for hour, _ in hour_paths
+                ):
                     model_hour_channels[model_name] = hourly_channels
             components = multi_forecast_daily_components(model_hour_channels)
             if geometry is None or not components:

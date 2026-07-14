@@ -287,12 +287,14 @@ def assemble(root, reference_time, learning_state=None):
             for name in weather.MULTI_FORECAST_MODELS:
                 document = documents.get(name, {})
                 hourly_channels = []
+                forecast_hours = []
                 for hour, tile in document.items():
                     if int(hour) // 24 != day:
                         continue
                     hourly_channels.append(tile[4])
+                    forecast_hours.append(int(hour))
                     geometry = geometry_arrays(tile)
-                if hourly_channels:
+                if weather.has_daily_extrema_coverage(forecast_hours):
                     model_hour_channels[name] = hourly_channels
             blend_hours = [
                 channels for hour, channels in consensus_hour_channels.items()
