@@ -1,0 +1,35 @@
+name: Weekly repository activity
+
+on:
+  schedule:
+    # Run once a week to keep scheduled workflows active.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Update activity marker
+        run: |
+          date -u +%Y-%m-%d > .github/weekly-activity.txt
+
+      - name: Commit activity marker
+        run: |
+          git add .github/weekly-activity.txt
+          if git diff --cached --quiet; then
+            echo "Activity marker is already current."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: record weekly repository activity'
+          git push
