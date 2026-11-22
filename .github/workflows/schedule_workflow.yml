@@ -17,15 +17,15 @@ jobs:
 
     steps:
       - name: Checkout Repository with Limited History
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 3  # Set the number of commits to fetch
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.8  # Change this to your Python version if needed
+          python-version: '3.12'
 
       - name: Install Dependencies
         run: |
